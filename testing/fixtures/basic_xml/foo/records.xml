@@ -10,7 +10,15 @@
 		<!--         ^complete bar -->
 		<button name="action_button" type="object" />
 		<!--          ^complete action_button action_button2 -->
+		<button name="action_button" />
+		<!--          ^complete action_button action_button2 -->
+		<button name="%(" />
+		<!--           ^complete foo bar -->
+		<button name="%(foo.action_buton_xml)d" />
+		<!--                ^complete action_button action_button2 -->
+		<button name="%(" type="action" />
+		<!--           ^complete foo bar -->
 		<button name="%(foo.action_buton_xml)d" type="action" />
-		<!--                ^ TODO action_buton_xml make this work-->
+		<!--                ^complate action_button action_button2 -->
 	</record>
 </odoo>
