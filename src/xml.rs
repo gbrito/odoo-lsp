@@ -8,7 +8,7 @@ use fomat_macros::fomat;
 use lasso::Spur;
 use tower_lsp_server::ls_types::*;
 use tracing::{debug, instrument, warn};
-use tree_sitter::Parser;
+
 use xmlparser::{ElementEnd, Error, StrSpan, StreamError, Token, Tokenizer};
 
 use crate::prelude::*;
@@ -21,6 +21,9 @@ use crate::record::Record;
 use crate::template::gather_templates;
 use crate::{ImStr, errloc, format_loc, some, utils::*};
 use crate::{backend::Backend, backend::Text};
+
+pub mod diagnostic_codes;
+pub mod validation;
 
 #[cfg(test)]
 mod tests;
@@ -112,7 +115,6 @@ impl Backend {
 		} else {
 			None
 		};
-		let path = uri.to_file_path().unwrap();
 		let path_uri = PathSymbol::strip_root(root, &path);
 		loop {
 			match reader.next() {
@@ -323,9 +325,7 @@ impl Backend {
 			}
 			Some(RefKind::Id) => self.index.jump_def_xml_id(needle, uri),
 			Some(RefKind::PyExpr(py_offset)) => {
-				// TODO: More general Python jumpdefs like mapped properties
-				let mut parser = Parser::new();
-				parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+				let mut parser = python_parser();
 				let ast = some!(parser.parse(needle, None));
 				let root = ast.root_node();
 				let (orig_scope, scope) = Index::walk_scope(root, Some(scope), |scope, node| {
@@ -388,6 +388,75 @@ impl Backend {
 			| None => Ok(None),
 		}
 	}
+
+	/// Prepares a rename operation by identifying the symbol at the cursor position.
+	/// Returns the symbol and its range if it can be renamed, None otherwise.
+	pub fn xml_prepare_rename(
+		&self,
+		params: TextDocumentPositionParams,
+		rope: RopeSlice<'_>,
+	) -> anyhow::Result<Option<(crate::backend::RenameableSymbol, Range)>> {
+		use crate::backend::RenameableSymbol;
+		use crate::index::_R;
+
+		let position = params.position;
+		let uri = &params.text_document.uri;
+		let path = some!(uri.to_file_path());
+		let (slice, cursor_by_char, relative_offset) = self.record_slice(rope, uri, position)?;
+		let slice_str = Cow::from(slice);
+		let mut reader = Tokenizer::from(slice_str.as_ref());
+		let XmlRefs {
+			ref_at_cursor,
+			ref_kind,
+			..
+		} = self.index.gather_refs(cursor_by_char, &mut reader, slice)?;
+
+		let (cursor_value, ref_range) = some!(ref_at_cursor);
+		let current_module = self.index.find_module_of(&path);
+
+		// Convert the range to LSP range
+		let lsp_range = rope_conv(
+			ref_range.clone().map_unit(|unit| ByteOffset(unit + relative_offset)),
+			rope,
+		);
+
+		match ref_kind {
+			Some(RefKind::Model) => {
+				let model = some!(_G(cursor_value));
+				Ok(Some((RenameableSymbol::ModelName(model.into()), lsp_range)))
+			}
+			Some(RefKind::Ref(_)) | Some(RefKind::Id) => {
+				// Resolve to qualified ID
+				let qualified_id = if cursor_value.contains('.') {
+					cursor_value.to_string()
+				} else if let Some(module) = current_module {
+					format!("{}.{}", _R(module), cursor_value)
+				} else {
+					cursor_value.to_string()
+				};
+				Ok(Some((
+					RenameableSymbol::XmlId {
+						qualified_id,
+						current_module,
+					},
+					lsp_range,
+				)))
+			}
+			Some(RefKind::TName) | Some(RefKind::TInherit) | Some(RefKind::TCall) => {
+				Ok(Some((RenameableSymbol::TemplateName(cursor_value.to_string()), lsp_range)))
+			}
+			// These symbol types are not yet supported for rename
+			Some(RefKind::PyExpr(_))
+			| Some(RefKind::PropertyName(_))
+			| Some(RefKind::MethodName(_))
+			| Some(RefKind::PropOf(..))
+			| Some(RefKind::Component)
+			| Some(RefKind::Widget)
+			| Some(RefKind::ActionTag)
+			| None => Ok(None),
+		}
+	}
+
 	pub fn xml_hover(&self, params: HoverParams, rope: RopeSlice<'_>) -> anyhow::Result<Option<Hover>> {
 		let position = params.text_document_position_params.position;
 		let uri = &params.text_document_position_params.text_document.uri;
@@ -449,8 +518,7 @@ impl Backend {
 			}
 			Some(RefKind::TInherit) | Some(RefKind::TCall) => Ok(self.index.hover_template(needle, lsp_range)),
 			Some(RefKind::PyExpr(py_offset)) => {
-				let mut parser = Parser::new();
-				parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+				let mut parser = python_parser();
 				let ast = some!(parser.parse(needle, None));
 				let root = ast.root_node();
 				let (tid, scope) = some!(self.index.type_of_node(
@@ -569,6 +637,520 @@ impl Backend {
 			arguments: Some(vec![String::new().into(), value.into()]),
 		})]))
 	}
+
+	/// Extract document symbols from XML files.
+	/// Returns records and templates as symbols.
+	pub fn xml_document_symbols(
+		&self,
+		_uri: &Uri,
+		rope: RopeSlice<'_>,
+	) -> anyhow::Result<Option<Vec<DocumentSymbol>>> {
+		let contents = Cow::from(rope);
+		let mut symbols = Vec::new();
+
+		let mut reader = Tokenizer::from(contents.as_ref());
+		let mut current_record: Option<(String, Range, Range)> = None; // (id, full_range_start, selection_range)
+
+		while let Some(token) = reader.next() {
+			let token = match token {
+				Ok(t) => t,
+				Err(_) => continue,
+			};
+
+			match token {
+				Token::ElementStart { local, span, .. } => {
+					let tag_name = local.as_str();
+					let start_pos: Position = rope_conv(ByteOffset(span.start()), rope);
+
+					match tag_name {
+						"record" | "template" | "menuitem" => {
+							// We'll capture the id in attribute processing
+							current_record = Some((
+								String::new(),
+								Range::new(start_pos, start_pos),
+								Range::new(start_pos, start_pos),
+							));
+						}
+						_ => {}
+					}
+				}
+				Token::Attribute { local, value, span, .. } => {
+					if let Some((ref mut id, _, ref mut selection_range)) = current_record {
+						let attr_name = local.as_str();
+						if attr_name == "id" || attr_name == "t-name" {
+							*id = value.as_str().to_string();
+							let start: Position = rope_conv(ByteOffset(span.start()), rope);
+							let end: Position = rope_conv(ByteOffset(span.end()), rope);
+							*selection_range = Range::new(start, end);
+						}
+					}
+				}
+				Token::ElementEnd { end, span } => {
+					if let ElementEnd::Close(_, local) = end {
+						let tag_name = local.as_str();
+						if matches!(tag_name, "record" | "template" | "menuitem") {
+							if let Some((id, mut range, selection_range)) = current_record.take() {
+								if !id.is_empty() {
+									let end_pos: Position = rope_conv(ByteOffset(span.end()), rope);
+									range.end = end_pos;
+
+									let kind = match tag_name {
+										"record" => SymbolKind::STRUCT,
+										"template" => SymbolKind::FUNCTION,
+										"menuitem" => SymbolKind::ENUM,
+										_ => SymbolKind::VARIABLE,
+									};
+
+									#[allow(deprecated)]
+									symbols.push(DocumentSymbol {
+										name: id,
+										detail: Some(tag_name.to_string()),
+										kind,
+										tags: None,
+										deprecated: None,
+										range,
+										selection_range,
+										children: None,
+									});
+								}
+							}
+						}
+					} else if let ElementEnd::Empty = end {
+						// Self-closing tag like <record ... />
+						if let Some((id, mut range, selection_range)) = current_record.take() {
+							if !id.is_empty() {
+								let end_pos: Position = rope_conv(ByteOffset(span.end()), rope);
+								range.end = end_pos;
+
+								#[allow(deprecated)]
+								symbols.push(DocumentSymbol {
+									name: id,
+									detail: None,
+									kind: SymbolKind::STRUCT,
+									tags: None,
+									deprecated: None,
+									range,
+									selection_range,
+									children: None,
+								});
+							}
+						}
+					}
+				}
+				_ => {}
+			}
+		}
+
+		if symbols.is_empty() {
+			Ok(None)
+		} else {
+			Ok(Some(symbols))
+		}
+	}
+
+	/// Provide diagnostics for XML files.
+	///
+	/// Performs two types of validation:
+	/// 1. Structural validation using roxmltree (validates element structure, required attributes, etc.)
+	/// 2. Streaming validation using xmlparser (validates groups attributes and ir.rule model_id references)
+	///
+	/// The structural validation is configurable via `diagnostics` config section.
+	pub fn diagnose_xml(
+		&self,
+		contents: &str,
+		rope: RopeSlice<'_>,
+		current_module: Option<crate::index::ModuleName>,
+	) -> Vec<Diagnostic> {
+		// Get diagnostics configuration
+		let diagnostics_config = self.get_diagnostics_config();
+
+		// Perform structural validation using roxmltree
+		let mut diagnostics = validation::validate_xml_document(
+			self,
+			contents,
+			rope,
+			current_module,
+			&diagnostics_config,
+		);
+
+		// Also perform streaming validation for additional checks
+		// (groups attributes and ir.rule model_id references)
+		self.diagnose_xml_streaming(contents, rope, current_module, &mut diagnostics);
+
+		diagnostics
+	}
+
+	/// Get diagnostics configuration, with defaults.
+	fn get_diagnostics_config(&self) -> crate::config::DiagnosticsConfig {
+		self.project_config
+			.diagnostics
+			.read()
+			.ok()
+			.map(|guard| guard.clone())
+			.unwrap_or_default()
+	}
+
+	/// Streaming XML validation for groups and ir.rule references.
+	///
+	/// This uses the streaming xmlparser for efficient validation without
+	/// building a full DOM tree.
+	fn diagnose_xml_streaming(
+		&self,
+		contents: &str,
+		rope: RopeSlice<'_>,
+		current_module: Option<crate::index::ModuleName>,
+		diagnostics: &mut Vec<Diagnostic>,
+	) {
+		use crate::index::_G;
+
+		let mut reader = Tokenizer::from(contents);
+
+		// Track context while parsing
+		let mut record_model: Option<&str> = None;
+		let mut in_field_model_id = false;
+
+		while let Some(token) = reader.next() {
+			let token = match token {
+				Ok(t) => t,
+				Err(_) => continue,
+			};
+
+			match token {
+				Token::ElementStart { local, .. } => {
+					match local.as_str() {
+						"record" => {
+							record_model = None;
+						}
+						"field" => {
+							// Will check name attribute
+						}
+						_ => {}
+					}
+				}
+				Token::Attribute { local, value, .. } => {
+					let attr_name = local.as_str();
+					let attr_value = value.as_str();
+
+					match attr_name {
+						// <record model="ir.rule">
+						"model" => {
+							record_model = Some(attr_value);
+						}
+						// <field name="model_id"> in ir.rule
+						"name" if attr_value == "model_id" && record_model == Some("ir.rule") => {
+							in_field_model_id = true;
+						}
+						// ref="..." in model_id field
+						"ref" if in_field_model_id => {
+							// Validate the model reference
+							let model_ref = attr_value.trim();
+							if !model_ref.is_empty() {
+								// Qualify if needed
+								let qualified = if model_ref.contains('.') {
+									std::borrow::Cow::Borrowed(model_ref)
+								} else if let Some(module) = current_module {
+									std::borrow::Cow::Owned(format!("{}.{}", crate::index::_R(module), model_ref))
+								} else {
+									std::borrow::Cow::Borrowed(model_ref)
+								};
+
+								// Check if the record exists
+								if _G(&qualified).is_none() || !self.index.records.contains_key(&_G(&qualified).unwrap()) {
+									diagnostics.push(Diagnostic {
+										range: rope_conv(value.range().map_unit(ByteOffset), rope),
+										severity: Some(DiagnosticSeverity::WARNING),
+										source: Some("odoo-lsp".to_string()),
+										message: format!("Model reference '{}' not found. Expected an ir.model record.", qualified),
+										..Default::default()
+									});
+								}
+							}
+						}
+						// groups="group1,group2,..."
+						"groups" => {
+							self.diagnose_groups_attribute_streaming(
+								attr_value,
+								value.range(),
+								rope,
+								current_module,
+								diagnostics,
+							);
+						}
+						_ => {}
+					}
+				}
+				Token::ElementEnd { end, .. } => {
+					if let ElementEnd::Close(..) | ElementEnd::Empty = end {
+						in_field_model_id = false;
+					}
+				}
+				_ => {}
+			}
+		}
+	}
+
+	/// Validate groups attribute value (comma-separated XML IDs) - streaming version.
+	fn diagnose_groups_attribute_streaming(
+		&self,
+		groups_value: &str,
+		range: std::ops::Range<usize>,
+		rope: RopeSlice<'_>,
+		current_module: Option<crate::index::ModuleName>,
+		diagnostics: &mut Vec<Diagnostic>,
+	) {
+		use crate::index::_G;
+
+		if groups_value.is_empty() {
+			return;
+		}
+
+		let mut offset = range.start;
+		for group in groups_value.split(',') {
+			let group = group.trim();
+			let group_start = offset + (groups_value[offset - range.start..].find(group).unwrap_or(0));
+			let group_end = group_start + group.len();
+			offset = group_end + 1; // +1 for comma
+
+			if group.is_empty() {
+				continue;
+			}
+
+			// Skip negated groups (e.g., "!base.group_user")
+			let group_ref = if let Some(stripped) = group.strip_prefix('!') {
+				stripped
+			} else {
+				group
+			};
+
+			// Qualify if needed
+			let qualified = if group_ref.contains('.') {
+				std::borrow::Cow::Borrowed(group_ref)
+			} else if let Some(module) = current_module {
+				std::borrow::Cow::Owned(format!("{}.{}", crate::index::_R(module), group_ref))
+			} else {
+				std::borrow::Cow::Borrowed(group_ref)
+			};
+
+			// Check if the group record exists
+			let group_exists = _G(&qualified)
+				.map(|key| self.index.records.contains_key(&key))
+				.unwrap_or(false);
+
+			if !group_exists {
+				diagnostics.push(Diagnostic {
+					range: rope_conv((group_start..group_end).map_unit(ByteOffset), rope),
+					severity: Some(DiagnosticSeverity::WARNING),
+					source: Some("odoo-lsp".to_string()),
+					message: format!("Group '{}' not found", qualified),
+					..Default::default()
+				});
+			}
+		}
+	}
+
+	/// Generate inlay hints for XML files.
+	/// Shows model names for record references, field types for field names, etc.
+	pub fn xml_inlay_hints(
+		&self,
+		uri: &Uri,
+		rope: RopeSlice<'_>,
+		range: Range,
+	) -> anyhow::Result<Option<Vec<InlayHint>>> {
+		let contents = Cow::from(rope);
+		let path = uri.to_file_path().ok_or_else(|| errloc!("uri.to_file_path failed"))?;
+		let current_module = self.index.find_module_of(&path);
+
+		// Convert LSP range to byte range for filtering
+		let ByteOffset(range_start) = rope_conv(range.start, rope);
+		let ByteOffset(range_end) = rope_conv(range.end, rope);
+
+		let mut hints = Vec::new();
+		let mut reader = Tokenizer::from(contents.as_ref());
+
+		// Track context while parsing
+		let mut record_model: Option<ImStr> = None; // model from <record model="...">
+		let mut arch_model: Option<ImStr> = None; // model from <field name="model">text</field>
+		let mut expect_model_text = false; // waiting for text content of <field name="model">
+		let mut in_arch = false;
+		let mut arch_depth = 0u32;
+		let mut depth = 0u32;
+
+		while let Some(token) = reader.next() {
+			let token = match token {
+				Ok(t) => t,
+				Err(_) => continue,
+			};
+
+			match token {
+				Token::ElementStart { local, .. } => {
+					depth += 1;
+					match local.as_str() {
+						"record" => {
+							record_model = None;
+							arch_model = None;
+						}
+						"field" if in_arch => {
+							// Field inside arch - we'll check the name attribute
+						}
+						_ => {}
+					}
+				}
+				Token::Attribute { local, value, span, .. } => {
+					let attr_start = span.start();
+					let attr_end = span.end();
+
+					let attr_name = local.as_str();
+					let attr_value = value.as_str();
+
+					match attr_name {
+						// <record model="..."> - track the record's model
+						"model" => {
+							record_model = Some(ImStr::from(attr_value));
+						}
+						// <field name="model"> - next text content is the arch model
+						"name" if attr_value == "model" && !in_arch => {
+							expect_model_text = true;
+						}
+						// <field name="arch"> - entering arch mode
+						"name" if attr_value == "arch" => {
+							in_arch = true;
+							arch_depth = depth;
+						}
+						// ref="record_id" - show the model of the referenced record
+						"ref" => {
+							// Skip if outside visible range
+							if attr_end >= range_start && attr_start <= range_end {
+								if let Some(hint) = self.hint_for_record_ref(attr_value, current_module, value.end(), rope) {
+									hints.push(hint);
+								}
+							}
+						}
+						// inherit_id="view_id" - show info about inherited view
+						"inherit_id" => {
+							// Skip if outside visible range
+							if attr_end >= range_start && attr_start <= range_end {
+								if let Some(hint) = self.hint_for_record_ref(attr_value, current_module, value.end(), rope) {
+									hints.push(hint);
+								}
+							}
+						}
+						// <field name="field_name"/> inside arch - show field type
+						"name" if in_arch && depth > arch_depth => {
+							// Use arch_model if available (from <field name="model">), otherwise fall back to record_model
+							let model = arch_model.as_ref().or(record_model.as_ref());
+							if let Some(model) = model {
+								// Skip if outside visible range
+								if attr_end >= range_start && attr_start <= range_end {
+									if let Some(hint) = self.hint_for_field_name(attr_value, model, value.end(), rope) {
+										hints.push(hint);
+									}
+								}
+							}
+						}
+						_ => {}
+					}
+				}
+				Token::Text { text } if expect_model_text => {
+					expect_model_text = false;
+					arch_model = Some(ImStr::from(text.as_str()));
+				}
+				Token::ElementEnd { end, .. } => {
+					if let ElementEnd::Close(..) | ElementEnd::Empty = end {
+						if in_arch && depth == arch_depth {
+							in_arch = false;
+						}
+						depth = depth.saturating_sub(1);
+					}
+				}
+				_ => {}
+			}
+		}
+
+		if hints.is_empty() {
+			Ok(None)
+		} else {
+			Ok(Some(hints))
+		}
+	}
+
+	/// Create an inlay hint for a record reference (ref="..." or inherit_id="...")
+	fn hint_for_record_ref(
+		&self,
+		record_id: &str,
+		current_module: Option<crate::index::ModuleName>,
+		byte_pos: usize,
+		rope: RopeSlice<'_>,
+	) -> Option<InlayHint> {
+		use crate::index::_I;
+
+		// Try to find the record - first with current module prefix, then as-is
+		let record = if record_id.contains('.') {
+			// Qualified ID like "base.main_company"
+			self.index.records.get(&_I(record_id))
+		} else if let Some(module) = current_module {
+			// Unqualified ID - try with current module prefix
+			let qualified = format!("{}.{}", _R(module), record_id);
+			self.index.records.get(&_I(&qualified))
+		} else {
+			None
+		};
+
+		let record = record?;
+		let model_name = record.model?;
+
+		let position: Position = rope_conv(ByteOffset(byte_pos), rope);
+		Some(InlayHint {
+			position,
+			label: InlayHintLabel::String(format!(": {}", _R(model_name))),
+			kind: Some(InlayHintKind::TYPE),
+			text_edits: None,
+			tooltip: None,
+			padding_left: Some(true),
+			padding_right: None,
+			data: None,
+		})
+	}
+
+	/// Create an inlay hint for a field name inside a view arch
+	fn hint_for_field_name(
+		&self,
+		field_name: &str,
+		model: &ImStr,
+		byte_pos: usize,
+		rope: RopeSlice<'_>,
+	) -> Option<InlayHint> {
+		let model_key = _G(model)?;
+		let entry = self.index.models.populate_properties(model_key.into(), &[])?;
+		let entry = entry.downgrade();
+		let fields = entry.fields.as_ref()?;
+
+		let field_key = _G(field_name)?;
+		let field = fields.get(&field_key)?;
+
+		// Format the field type
+		let type_str = match &field.kind {
+			FieldKind::Value => _R(field.type_).to_string(),
+			FieldKind::Relational(comodel) => {
+				format!("{}[{}]", _R(field.type_), _R(*comodel))
+			}
+			FieldKind::Related(path) => {
+				format!("Related({})", path)
+			}
+		};
+
+		let position: Position = rope_conv(ByteOffset(byte_pos), rope);
+		Some(InlayHint {
+			position,
+			label: InlayHintLabel::String(format!(": {}", type_str)),
+			kind: Some(InlayHintKind::TYPE),
+			text_edits: None,
+			tooltip: None,
+			padding_left: Some(true),
+			padding_right: None,
+			data: None,
+		})
+	}
+
 	pub(crate) fn xml_debug_inspect_type(
 		&self,
 		params: TextDocumentPositionParams,
@@ -588,8 +1170,7 @@ impl Backend {
 		let (Some((needle, _)), Some(RefKind::PyExpr(py_offset))) = (ref_at_cursor, ref_kind) else {
 			return Ok(None);
 		};
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let ast = some!(parser.parse(needle, None));
 		let root = ast.root_node();
 		let (type_, _) =
@@ -608,7 +1189,9 @@ impl Index {
 		relative_offset: usize,
 		reader: &mut Tokenizer<'read>,
 	) -> Result<Option<CompletionResponse>, anyhow::Error> {
-		let current_module = self.find_module_of(path).expect("must be in a module");
+		let current_module = self
+			.find_module_of(path)
+			.unwrap_or_else(|| panic!("{}", format_loc!("path {} must be in a module", path.display())));
 
 		let mut items = MaxVec::new(completions_limit);
 		let XmlRefs {
@@ -715,8 +1298,7 @@ impl Index {
 				)?;
 			}
 			RefKind::PyExpr(py_offset) => 'expr: {
-				let mut parser = Parser::new();
-				parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+				let mut parser = python_parser();
 				let ast = some!(parser.parse(value, None));
 				let Some((object, field, range)) = Backend::attribute_node_at_offset(py_offset, ast.root_node(), value)
 				else {
@@ -812,8 +1394,7 @@ impl Index {
 		let mut expect_action_tag = false;
 		let mut button_type: Option<&str> = None;
 		let mut scope = Scope::default();
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 
 		let mut foreach_as = attr_pair("t-foreach", "t-as");
 		let mut set_value = attr_pair("t-set", "t-value");
@@ -915,6 +1496,20 @@ impl Index {
 						"widget" if value_in_range && arch_depth > 0 => {
 							ref_kind = Some(RefKind::Widget);
 							ref_at_cursor = Some((value.as_str(), value.range()));
+						}
+						// Domain attributes are Python expressions (list of tuples)
+						"domain" if value_in_range && arch_depth > 0 => {
+							ref_at_cursor = Some((value.as_str(), value.range()));
+							ref_kind = Some(RefKind::PyExpr(offset_at_cursor.saturating_sub(value.start())));
+						}
+						// Modifier attributes (invisible, readonly, required, column_invisible) 
+						// can contain domain expressions or simple Python boolean expressions
+						attr if value_in_range 
+							&& arch_depth > 0 
+							&& matches!(attr, "invisible" | "readonly" | "required" | "column_invisible") =>
+						{
+							ref_at_cursor = Some((value.as_str(), value.range()));
+							ref_kind = Some(RefKind::PyExpr(offset_at_cursor.saturating_sub(value.start())));
 						}
 						_ => {}
 					}

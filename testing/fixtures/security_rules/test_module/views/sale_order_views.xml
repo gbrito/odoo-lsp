@@ -1,0 +1,27 @@
+<?xml version="1.0" encoding="utf-8"?>
+<odoo>
+    <!-- Valid group reference -->
+    <record id="view_sale_order_form" model="ir.ui.view">
+        <field name="name">sale.order.form</field>
+        <field name="model">sale.order</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="name"/>
+                <field name="partner_id" groups="base.group_user"/>
+            </form>
+        </field>
+    </record>
+
+    <!-- Invalid group reference -->
+    <record id="view_sale_order_tree" model="ir.ui.view">
+        <field name="name">sale.order.tree</field>
+        <field name="model">sale.order</field>
+        <field name="arch" type="xml">
+            <tree>
+                <field name="name"/>
+                <field name="partner_id" groups="base.invalid_group"/>
+                <!--                             ^diag Group 'base.invalid_group' not found -->
+            </tree>
+        </field>
+    </record>
+</odoo>

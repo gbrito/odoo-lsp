@@ -12,20 +12,21 @@ use dashmap::DashMap;
 use fomat_macros::fomat;
 use lasso::Spur;
 use ropey::Rope;
-use tracing::instrument;
-use tree_sitter::{Node, Parser, QueryCursor, StreamingIterator};
+use tracing::{instrument, trace};
+use tree_sitter::{Node, QueryCursor, StreamingIterator};
 
 use crate::{
 	ImStr, dig, format_loc,
 	index::{_G, _I, _R, Index, Symbol},
 	model::{Method, ModelName, PropertyInfo},
+	prelude::PathSymbol,
 	test_utils,
-	utils::{ByteOffset, ByteRange, Defer, PreTravel, RangeExt, TryResultExt, python_next_named_sibling, rope_conv},
+	utils::{ByteOffset, ByteRange, Defer, PreTravel, RangeExt, TryResultExt, python_next_named_sibling, python_parser, rope_conv},
 };
 use ts_macros::query;
 
 mod scope;
-pub use scope::Scope;
+pub use scope::{ImportInfo, ImportMap, Scope};
 
 pub fn type_cache() -> &'static TypeCache {
 	static CACHE: OnceLock<TypeCache> = OnceLock::new();
@@ -75,6 +76,87 @@ pub static MODEL_METHODS: phf::Set<&str> = phf::phf_set!(
 	"save",
 );
 
+/// Describes an attribute of the Odoo Environment (odoo.api.Environment).
+#[derive(Debug, Clone, Copy)]
+pub struct EnvAttribute {
+	/// The attribute name (e.g., "user", "company")
+	pub name: &'static str,
+	/// The type as displayed in hover (e.g., "res.users", "int", "bool")
+	pub type_display: &'static str,
+	/// If this attribute returns a model, the model name (for go-to-definition)
+	pub model: Option<&'static str>,
+	/// The LSP completion item kind
+	pub kind: EnvAttrKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnvAttrKind {
+	/// A model recordset (e.g., user, company)
+	Model,
+	/// A method/function (e.g., ref)
+	Method,
+	/// A simple property (e.g., uid, lang, su)
+	Property,
+}
+
+/// All known attributes of odoo.api.Environment
+pub static ENV_ATTRIBUTES: &[EnvAttribute] = &[
+	EnvAttribute {
+		name: "user",
+		type_display: "res.users",
+		model: Some("res.users"),
+		kind: EnvAttrKind::Model,
+	},
+	EnvAttribute {
+		name: "company",
+		type_display: "res.company",
+		model: Some("res.company"),
+		kind: EnvAttrKind::Model,
+	},
+	EnvAttribute {
+		name: "companies",
+		type_display: "res.company",
+		model: Some("res.company"),
+		kind: EnvAttrKind::Model,
+	},
+	EnvAttribute {
+		name: "uid",
+		type_display: "int",
+		model: None,
+		kind: EnvAttrKind::Property,
+	},
+	EnvAttribute {
+		name: "lang",
+		type_display: "str | None",
+		model: None,
+		kind: EnvAttrKind::Property,
+	},
+	EnvAttribute {
+		name: "su",
+		type_display: "bool",
+		model: None,
+		kind: EnvAttrKind::Property,
+	},
+	EnvAttribute {
+		name: "cr",
+		type_display: "Cursor",
+		model: None,
+		kind: EnvAttrKind::Property,
+	},
+	EnvAttribute {
+		name: "context",
+		type_display: "dict",
+		model: None,
+		kind: EnvAttrKind::Property,
+	},
+	EnvAttribute {
+		name: "ref",
+		type_display: "fn(xml_id) -> record",
+		model: None,
+		kind: EnvAttrKind::Method,
+	},
+];
+
 /// The subset of types that may resolve to a model.
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub enum Type {
@@ -88,6 +170,8 @@ pub enum Type {
 	Record(ImStr),
 	Super,
 	Method(ModelName, ImStr),
+	/// Module-level function reference (file path, function name).
+	Function(PathSymbol, Symbol<crate::model::Function>),
 	/// To hardcode some methods, such as dict.items()
 	PythonMethod(TypeId, ImStr),
 	/// `odoo.http.request`
@@ -100,6 +184,12 @@ pub enum Type {
 	List(ListElement),
 	Tuple(Vec<TypeId>),
 	Iterable(Option<TypeId>),
+	/// Union of multiple possible types (e.g., `X | Y`, `Optional[X]` = `X | None`).
+	/// Invariant: len >= 2 (single-element "unions" are simplified to the element itself).
+	/// Always flattened and deduplicated.
+	Union(Vec<TypeId>),
+	/// Python's None type.
+	None,
 	/// Can never be resolved, useful for non-model bindings.
 	Value,
 }
@@ -199,6 +289,31 @@ impl TypeCache {
 	#[inline]
 	pub fn resolve<T: Borrow<TypeId>>(&self, id: T) -> &Type {
 		unsafe { self.types.get_unchecked(id.borrow().0 as usize) }
+	}
+	/// Creates a union type from multiple types.
+	/// - Flattens nested unions
+	/// - Deduplicates identical types
+	/// - Returns the single type if only one remains after deduplication
+	/// - Returns None if no types provided
+	pub fn union(&self, types: impl IntoIterator<Item = TypeId>) -> Option<TypeId> {
+		let mut flat: Vec<TypeId> = Vec::new();
+
+		for tid in types {
+			match self.resolve(tid) {
+				Type::Union(inner) => flat.extend(inner),
+				_ => flat.push(tid),
+			}
+		}
+
+		// Deduplicate: sort by inner u32 for consistent ordering, then dedup
+		flat.sort_by_key(|t| t.0);
+		flat.dedup();
+
+		match flat.len() {
+			0 => None,
+			1 => Some(flat[0]),
+			_ => Some(self.get_or_intern(Type::Union(flat))),
+		}
 	}
 }
 
@@ -300,6 +415,79 @@ query! {
   (#eq? @_update "update"))
 }
 
+#[rustfmt::skip]
+query! {
+	PyImportsQuery(ImportModule, ImportName, ImportAlias);
+
+(import_from_statement
+  module_name: (dotted_name) @IMPORT_MODULE
+  name: (dotted_name) @IMPORT_NAME)
+
+(import_from_statement
+  module_name: (dotted_name) @IMPORT_MODULE
+  name: (aliased_import
+    name: (dotted_name) @IMPORT_NAME
+    alias: (identifier) @IMPORT_ALIAS))
+
+(import_statement
+  name: (dotted_name) @IMPORT_NAME)
+
+(import_statement
+  name: (aliased_import
+    name: (dotted_name) @IMPORT_NAME
+    alias: (identifier) @IMPORT_ALIAS))
+}
+
+/// Parse import statements from Python content and return a map of imported names to their module paths.
+pub fn parse_imports(root: Node, contents: &str) -> ImportMap {
+	let query = PyImportsQuery::query();
+	let mut cursor = QueryCursor::new();
+	let mut imports = ImportMap::new();
+
+	let mut matches = cursor.matches(query, root, contents.as_bytes());
+	while let Some(match_) = matches.next() {
+		let mut module_path = None;
+		let mut import_name = None;
+		let mut alias = None;
+
+		for capture in match_.captures {
+			let capture_text = &contents[capture.node.byte_range()];
+
+			match PyImportsQuery::from(capture.index) {
+				Some(PyImportsQuery::ImportModule) => {
+					module_path = Some(capture_text.to_string());
+				}
+				Some(PyImportsQuery::ImportName) => {
+					import_name = Some(capture_text.to_string());
+				}
+				Some(PyImportsQuery::ImportAlias) => {
+					alias = Some(capture_text.to_string());
+				}
+				_ => {}
+			}
+		}
+
+		if let Some(name) = import_name {
+			let full_module_path = if let Some(module) = module_path {
+				module // For "from module import name", the module path is just the module
+			} else {
+				name.clone() // For "import name", the module path is the name itself
+			};
+
+			let key = alias.unwrap_or_else(|| name.clone());
+			imports.insert(
+				key,
+				ImportInfo {
+					module_path: full_module_path,
+					imported_name: name,
+				},
+			);
+		}
+	}
+
+	imports
+}
+
 pub type ScopeControlFlow = ControlFlow<Option<Scope>, bool>;
 impl Index {
 	#[inline]
@@ -308,8 +496,32 @@ impl Index {
 		self.try_resolve_model(_TR!(type_at_cursor), &scope)
 	}
 	pub fn type_of_range(&self, root: Node<'_>, range: ByteRange, contents: &str) -> Option<(TypeId, Scope)> {
+		self.type_of_range_with_path(root, range, contents, None)
+	}
+
+	pub fn type_of_range_with_path(
+		&self,
+		root: Node<'_>,
+		range: ByteRange,
+		contents: &str,
+		current_path: Option<PathSymbol>,
+	) -> Option<(TypeId, Scope)> {
 		// Phase 1: Determine the scope.
 		let (self_type, fn_scope, self_param) = determine_scope(root, contents, range.start.0)?;
+
+		// Phase 1.5: Parse imports from the file
+		// We need to parse from the module root, not from the class/function scope
+		let module_root = {
+			let mut node = root;
+			while node.kind() != "module" {
+				match node.parent() {
+					Some(parent) => node = parent,
+					None => break,
+				}
+			}
+			node
+		};
+		let imports = Arc::new(parse_imports(module_root, contents));
 
 		// Phase 2: Build the scope up to offset
 		// What contributes to a method scope's variables?
@@ -323,6 +535,9 @@ impl Index {
 			Some(type_) => &contents[type_.byte_range().shrink(1)],
 			None => "",
 		};
+		scope.super_ = Some(self_param.into());
+		scope.current_path = current_path;
+		scope.imports = Some(imports);
 		scope.insert(self_param.to_string(), Type::Model(self_type.into()));
 		scope.super_ = Some(self_param.into());
 
@@ -563,7 +778,7 @@ impl Index {
 					// TODO: Remove this hardcoded case
 					if callee.kind() == "identifier"
 						&& "Form" == &contents[callee.byte_range()]
-						&& let Some(first_arg) = value.named_child(1).expect("call args").named_child(0)
+						&& let Some(first_arg) = value.named_child(1).expect("call node must have argument_list").named_child(0)
 						&& let Some(type_) = self.type_of(first_arg, scope, contents)
 					{
 						let alias = &contents[alias.byte_range()];
@@ -571,6 +786,62 @@ impl Index {
 					} else if let Some(type_) = self.type_of(value, scope, contents) {
 						let alias = &contents[alias.byte_range()];
 						scope.insert(alias.to_string(), _TR!(type_).clone());
+					}
+				}
+			}
+			"except_clause" => {
+				// except ExceptionType as alias:
+				// Structure with alias:
+				//   (except_clause
+				//     (as_pattern
+				//       (identifier)           ; exception type
+				//       (as_pattern_target
+				//         (identifier)))       ; alias
+				//     (block ...))
+				// Structure without alias:
+				//   (except_clause
+				//     (identifier)             ; exception type
+				//     (block ...))
+				// Structure with tuple:
+				//   (except_clause
+				//     (as_pattern
+				//       (tuple ...)            ; exception types
+				//       (as_pattern_target
+				//         (identifier)))       ; alias
+				//     (block ...))
+				if let Some(as_pattern) = dig!(node, as_pattern)
+					&& let Some(as_pattern_target) = dig!(as_pattern, as_pattern_target(1))
+					&& let Some(alias) = dig!(as_pattern_target, identifier)
+				{
+					let alias_name = &contents[alias.byte_range()];
+					// Get the exception type(s)
+					if let Some(exc_type) = as_pattern.named_child(0) {
+						let type_ = match exc_type.kind() {
+							"identifier" => {
+								// Single exception type: `except ValueError as e:`
+								let exc_name = &contents[exc_type.byte_range()];
+								Type::PyBuiltin(exc_name.into())
+							}
+							"tuple" => {
+								// Multiple exception types: `except (ValueError, KeyError) as e:`
+								// Create a union of all exception types
+								let mut cursor = exc_type.walk();
+								let type_ids: Vec<TypeId> = exc_type
+									.named_children(&mut cursor)
+									.filter(|child| child.kind() == "identifier")
+									.map(|child| {
+										let exc_name = &contents[child.byte_range()];
+										_T!(Type::PyBuiltin(exc_name.into()))
+									})
+									.collect();
+							match type_cache().union(type_ids) {
+								Some(tid) => type_cache().resolve(tid).clone(),
+								None => Type::PyBuiltin("Exception".into()),
+							}
+							}
+							_ => Type::PyBuiltin("Exception".into()),
+						};
+						scope.insert(alias_name.to_string(), type_);
 					}
 				}
 			}
@@ -683,25 +954,49 @@ impl Index {
 				self.type_of(rhs, scope, contents)
 			}
 			"call" => self.type_of_call_node(node, scope, contents),
-			"binary_operator" | "boolean_operator" => {
-				// (_ left right)
+			"binary_operator" => {
 				if let Some(left) = node.child_by_field_name("left")
-					&& let Some(typ) = self.type_of(left, scope, contents)
+					&& let Some(left) = self.type_of(left, scope, contents)
 				{
-					Some(typ)
-				} else {
-					self.type_of(node.child_by_field_name("right")?, scope, contents)
+					return Some(left);
+				}
+
+				self.type_of(node.child_by_field_name("right")?, scope, contents)
+			}
+			"boolean_operator" => {
+				// For `or`: result could be either left or right
+				// For `and`: if truthy returns right, if falsy returns left
+				// In both cases, the result is a union of both types
+				let left = node
+					.child_by_field_name("left")
+					.and_then(|n| self.type_of(n, scope, contents));
+				let right = node
+					.child_by_field_name("right")
+					.and_then(|n| self.type_of(n, scope, contents));
+
+				match (left, right) {
+					(Some(l), Some(r)) => type_cache().union([l, r]),
+					(Some(l), None) | (None, Some(l)) => Some(l),
+					(None, None) => None,
 				}
 			}
 			"conditional_expression" => {
 				// a if b else c
-				let ty = node
+				// In Python's AST: named_child(0) = consequence (a)
+				//                  named_child(1) = condition (b)
+				//                  named_child(2) = alternative (c)
+				let then_ty = node
 					.named_child(0)
 					.and_then(|child| self.type_of(child, scope, contents));
-				ty.or_else(|| {
-					node.named_child(2)
-						.and_then(|child| self.type_of(child, scope, contents))
-				})
+				let else_ty = node
+					.named_child(2)
+					.and_then(|child| self.type_of(child, scope, contents));
+
+				match (then_ty, else_ty) {
+					(Some(a), Some(b)) => type_cache().union([a, b]),
+					(Some(a), None) | (None, Some(a)) => Some(a),
+					(None, None) => None,
+				}
 			}
 			"dictionary_comprehension" => {
 				let pair = dig!(node, pair)?;
@@ -780,6 +1075,7 @@ impl Index {
 			"integer" => Some(_T!( @ "int")),
 			"float" => Some(_T!( @ "float")),
 			"true" | "false" | "comparison_operator" => Some(_T!( @ "bool")),
+			"none" => Some(_T!(Type::None)),
 			_ => None,
 		}
 	}
@@ -788,7 +1084,18 @@ impl Index {
 			Type::Model(_) => Some(tid),
 			Type::List(inner) => inner.clone().into(),
 			Type::Iterable(inner) => *inner,
-			// TODO: tuple -> union
+			Type::Tuple(elements) => {
+				// Union of all tuple element types
+				type_cache().union(elements.clone())
+			}
+			Type::Union(types) => {
+				// Union of iterable element types from each union member
+				let element_types: Vec<TypeId> = types
+					.iter()
+					.filter_map(|tid| self.type_of_iterable(*tid))
+					.collect();
+				type_cache().union(element_types)
+			}
 			_ => None,
 		}
 	}
@@ -833,19 +1140,46 @@ impl Index {
 						return Some(_T!(Type::Tuple(children.collect())));
 					}
 				}
-				"dict" => {
-					let arg = call.named_child(1)?.named_child(0)?;
-					let arg = self.type_of(arg, scope, contents)?;
-					let arg = self.type_of_iterable(arg)?;
-					if let Type::Tuple(tuple) = _TR!(arg)
-						&& let [lhs, rhs] = &tuple[..]
-					{
-						return Some(_T!(Type::Dict(*lhs, *rhs)));
-					}
-					return Some(_T!(Type::Dict(_T!(Type::Value), _T!(Type::Value))));
-				}
 				"super" => {}
-				_ => return None,
+				func_name => {
+					// Try to look up as a module-level function
+					use crate::model::Function;
+					let func_sym: Symbol<Function> = _I(func_name).into();
+
+					// First, try to find in the current file
+					if let Some(current_path) = scope.current_path {
+						if let Some(funcs) = self.functions.get(&current_path) {
+							if funcs.contains_key(&func_sym) {
+								// Found function in current file - evaluate its return type
+								if let Some(rtype) = self.eval_function_rtype(func_sym, current_path) {
+									return Some(rtype);
+								}
+							}
+						}
+					}
+
+					// Check if this is an imported function
+					if let Some(import_info) = scope.get_import(func_name) {
+						// Resolve the import to a file path
+						if let Some(file_path) = self.resolve_py_module(&import_info.module_path) {
+							let import_func_sym: Symbol<Function> = _I(&import_info.imported_name).into();
+							if let Some((path_sym, _)) = self.functions.find_in_file(&file_path, &import_func_sym) {
+								if let Some(rtype) = self.eval_function_rtype(import_func_sym, path_sym) {
+									return Some(rtype);
+								}
+							}
+						}
+					}
+
+					// Fall back to global search
+					if let Some((path, _)) = self.functions.find_by_name(&func_sym) {
+						if let Some(rtype) = self.eval_function_rtype(func_sym, path) {
+							return Some(rtype);
+						}
+					}
+
+					return None;
+				}
 			};
 		}
 
@@ -928,30 +1262,15 @@ impl Index {
 				let mut aggs = vec![];
 				let args = call.named_child(1)?;
 
-				#[derive(PartialEq, Eq)]
-				enum Aggregation<'a> {
-					Recordset,
-					Raw(&'a str),
-				}
-
-				fn gather_attributes<'out>(
-					contents: &'out str,
-					arg: Node,
-					out: &mut Vec<(&'out str, Option<Aggregation<'out>>)>,
-				) {
+				fn gather_attributes<'out>(contents: &'out str, arg: Node, out: &mut Vec<&'out str>) {
 					let mut cursor = arg.walk();
 					for field in arg.named_children(&mut cursor) {
 						if let Some(field) = dig!(field, string_content(1)) {
 							let mut field = &contents[field.byte_range()];
-							let mut agg = None;
-							if let Some((inner, raw_agg)) = field.split_once(':') {
+							if let Some((inner, _)) = field.split_once(':') {
 								field = inner;
-								match raw_agg {
-									"recordset" => agg = Some(Aggregation::Recordset),
-									_ => agg = Some(Aggregation::Raw(raw_agg)),
-								}
 							}
-							out.push((field, agg));
+							out.push(field);
 						}
 					}
 				}
@@ -984,38 +1303,16 @@ impl Index {
 				groupby.extend(aggs);
 				groupby.dedup();
 				let model = Type::Model(_R(*model).into());
-				let model_tid = _T!(model.clone());
 				let value_id = _T!(Type::Value);
 				// FIXME: This is not quite correct as only recordset and numeric aggregations make sense.
-				let aggs = groupby.into_iter().map(|(attr, agg)| {
-					if attr == "id"
-						&& let Some(Aggregation::Recordset) = agg
-					{
-						return model_tid;
-					}
-					match self.type_of_attribute(&model, attr, scope) {
+				let aggs = groupby
+					.into_iter()
+					.map(|attr| match self.type_of_attribute(&model, attr, scope) {
 						Some(type_) => _T!(type_),
 						None => value_id,
-					}
-				});
+					});
 				let tuple = _T!(Type::Tuple(aggs.collect()));
 				Some(_T!(Type::List(ListElement::Occupied(tuple))))
-			}
-			Type::Method(model, read) if read.as_str() == "read" => {
-				let model = Type::Model(_R(model).into());
-				let args = call.named_child(1)?;
-				let fields = dig!(args, list)?;
-				let mut dict: Vec<(DictKey, TypeId)> = vec![];
-				for field in fields.named_children(&mut fields.walk()) {
-					let Some(field) = dig!(field, string_content(1)) else {
-						continue;
-					};
-					let key = &contents[field.byte_range()];
-					if let Some(field_ty) = self.type_of_attribute(&model, key, scope) {
-						dict.push((DictKey::String(key.into()), _T!(field_ty)));
-					}
-				}
-				Some(_T!(Type::List(ListElement::Occupied(_T!(Type::DictBag(dict))))))
 			}
 			Type::Method(model, method) => {
 				let method = _G(method)?;
@@ -1069,12 +1366,15 @@ impl Index {
 			| Type::List(..)
 			| Type::Iterable(..)
 			| Type::Tuple(..)
-			| Type::PythonMethod(..) => None,
+			| Type::PythonMethod(..)
+			| Type::Union(..)
+			| Type::Function(..)
+			| Type::None => None,
 		}
 	}
 
 	#[instrument(skip_all, fields(model, method))]
-	pub fn prepare_call_scope(
+	fn prepare_call_scope(
 		&self,
 		model: ModelName,
 		method: Symbol<Method>,
@@ -1140,6 +1440,14 @@ impl Index {
 			"ref" if matches!(lhs, Type::Env) => Some(Type::RefFn),
 			"user" if matches!(lhs, Type::Env) => Some(Type::Model("res.users".into())),
 			"company" | "companies" if matches!(lhs, Type::Env) => Some(Type::Model("res.company".into())),
+			"uid" if matches!(lhs, Type::Env) => Some(Type::PyBuiltin("int".into())),
+			"lang" if matches!(lhs, Type::Env) => Some(Type::Union(vec![
+				_T!(Type::PyBuiltin("str".into())),
+				_T!(Type::None),
+			])),
+			"su" if matches!(lhs, Type::Env) => Some(Type::PyBuiltin("bool".into())),
+			"cr" if matches!(lhs, Type::Env) => Some(Type::PyBuiltin("Cursor".into())),
+			"context" if matches!(lhs, Type::Env) => Some(Type::PyBuiltin("dict".into())),
 			"mapped" | "grouped" | "_read_group" | "read" => {
 				let model = self.try_resolve_model(lhs, scope)?;
 				Some(Type::Method(model, attrname.into()))
@@ -1186,9 +1494,9 @@ impl Index {
 			}
 		} else {
 			match attr {
-				"id" if matches!(type_, Type::Model(..) | Type::Record(..)) => Some(Type::PyBuiltin("Id".into())),
+				"id" if matches!(type_, Type::Model(..) | Type::Record(..)) => Some(Type::PyBuiltin("int".into())),
 				"ids" if matches!(type_, Type::Model(..) | Type::Record(..)) => {
-					Some(Type::List(ListElement::Occupied(_T!(Type::PyBuiltin("Id".into())))))
+					Some(Type::List(ListElement::Occupied(_T!(Type::PyBuiltin("int".into())))))
 				}
 				"display_name" if matches!(type_, Type::Model(..) | Type::Record(..)) => {
 					Some(Type::PyBuiltin("str".into()))
@@ -1227,9 +1535,288 @@ impl Index {
 				record.model
 			}
 			Type::Super => self.try_resolve_model(scope.get(scope.super_.as_deref()?)?, scope),
+			Type::Union(types) => {
+				// Return the first model found in the union
+				// This is useful for completions - we show fields from any possible model
+				for tid in types {
+					if let Some(model) = self.try_resolve_model(&type_cache().resolve(*tid), scope) {
+						return Some(model);
+					}
+				}
+				None
+			}
 			_ => None,
 		}
 	}
+
+	// ========== Call Hierarchy: Call Collection ==========
+
+	/// Process a call node and add it to the call graph if we can resolve the callee.
+	fn collect_call(
+		&self,
+		call: Node,
+		scope: &Scope,
+		caller: &crate::call_graph::CallableId,
+		contents: &str,
+		file_path: PathSymbol,
+	) {
+		use crate::call_graph::{CallType, CallableId};
+		use crate::utils::MinLoc;
+
+		let Some(func) = call.named_child(0) else {
+			return;
+		};
+
+		let call_location = MinLoc {
+			path: file_path,
+			range: crate::utils::span_conv(call.range()),
+		};
+
+		match func.kind() {
+			"identifier" => {
+				let func_name = &contents[func.byte_range()];
+				// Skip "super" - it's handled as attribute call super().method()
+				if func_name == "super" {
+					return;
+				}
+
+				// Try to resolve as function call
+				if let Some(callee) = self.resolve_function_callee(func_name, scope, file_path) {
+					self.call_graph.add_call(
+						Some(caller.clone()),
+						callee,
+						call_location,
+						CallType::Direct,
+					);
+				}
+			}
+			"attribute" => {
+				// Method call: obj.method()
+				let Some(method_node) = func.child_by_field_name("attribute") else {
+					return;
+				};
+				let Some(obj_node) = func.child_by_field_name("object") else {
+					return;
+				};
+				let method_name = &contents[method_node.byte_range()];
+
+				// Check for super().method() pattern
+				let is_super_call = obj_node.kind() == "call"
+					&& obj_node
+						.named_child(0)
+						.is_some_and(|id| id.kind() == "identifier" && &contents[id.byte_range()] == "super");
+
+				if is_super_call {
+					// Super call - resolve via scope.super_ and ancestors
+					if let Some(callee) = self.resolve_super_callee(method_name, scope) {
+						self.call_graph.add_call(
+							Some(caller.clone()),
+							callee,
+							call_location,
+							CallType::Super,
+						);
+					}
+				} else {
+					// Regular method call - resolve object type
+					if let Some(tid) = self.type_of(obj_node, scope, contents) {
+						let type_ = type_cache().resolve(tid);
+						if let Some(model) = self.try_resolve_model(&type_, scope) {
+							let callee = CallableId::method(_R(model), method_name);
+							self.call_graph.add_call(
+								Some(caller.clone()),
+								callee,
+								call_location,
+								CallType::Direct,
+							);
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
+	/// Resolve a function name to a CallableId.
+	fn resolve_function_callee(
+		&self,
+		name: &str,
+		scope: &Scope,
+		current_path: PathSymbol,
+	) -> Option<crate::call_graph::CallableId> {
+		use crate::call_graph::CallableId;
+		use crate::model::Function;
+
+		let func_sym: Symbol<Function> = _I(name).into();
+
+		// 1. Check current file
+		if let Some(funcs) = self.functions.get(&current_path) {
+			if funcs.contains_key(&func_sym) {
+				return Some(CallableId::function(current_path.as_string(), name));
+			}
+		}
+
+		// 2. Check imports
+		if let Some(import_info) = scope.get_import(name) {
+			if let Some(file_path) = self.resolve_py_module(&import_info.module_path) {
+				let import_sym: Symbol<Function> = _I(&import_info.imported_name).into();
+				if let Some((path_sym, _)) = self.functions.find_in_file(&file_path, &import_sym) {
+					return Some(CallableId::function(
+						path_sym.as_string(),
+						&import_info.imported_name,
+					));
+				}
+			}
+		}
+
+		// 3. Global search (fallback)
+		if let Some((path, _)) = self.functions.find_by_name(&func_sym) {
+			return Some(CallableId::function(path.as_string(), name));
+		}
+
+		None
+	}
+
+	/// Resolve a super().method() call to a CallableId.
+	fn resolve_super_callee(&self, method_name: &str, scope: &Scope) -> Option<crate::call_graph::CallableId> {
+		use crate::call_graph::CallableId;
+
+		// Get the current model from scope
+		let super_param = scope.super_.as_deref()?;
+		let current_type = scope.get(super_param)?;
+
+		let model_name = match current_type {
+			Type::Model(name) => name.clone(),
+			_ => return None,
+		};
+
+		// Look up the model to find its ancestors
+		let model_key = _G(&*model_name)?;
+		let entry = self.models.get(&model_key)?;
+
+		// The first ancestor is the primary parent for super() calls
+		let parent_model = entry.ancestors.first()?;
+		let parent_name = _R(*parent_model);
+
+		Some(CallableId::method(parent_name, method_name))
+	}
+
+	/// Collect calls from module-level code (outside functions/methods).
+	/// This handles calls at the top level of a Python file.
+	pub fn collect_module_level_calls(&self, path: PathSymbol, contents: &str, ast: &tree_sitter::Tree) {
+		use crate::utils::PreTravel;
+
+		let imports = std::sync::Arc::new(parse_imports(ast.root_node(), contents));
+		let mut scope = Scope::default();
+		scope.current_path = Some(path);
+		scope.imports = Some(imports);
+
+		// Traverse module-level statements
+		let module = ast.root_node();
+
+		for node in PreTravel::new(module) {
+			if !node.is_named() {
+				continue;
+			}
+
+			// Skip function and class definitions - they have their own scope
+			if matches!(
+				node.kind(),
+				"function_definition" | "class_definition" | "decorated_definition"
+			) {
+				continue;
+			}
+
+			// For call expressions at module level, collect them with no caller
+			if node.kind() == "call" {
+				// Check if this call is at module level (not inside a function/class)
+				let is_module_level = {
+					let mut current = node;
+					let mut at_module_level = true;
+					while let Some(parent) = current.parent() {
+						if matches!(
+							parent.kind(),
+							"function_definition" | "class_definition"
+						) {
+							at_module_level = false;
+							break;
+						}
+						current = parent;
+					}
+					at_module_level
+				};
+
+				if is_module_level {
+					self.collect_call_optional_caller(node, &scope, None, contents, path);
+				}
+			}
+		}
+	}
+
+	/// Process a call node with an optional caller (for module-level calls).
+	fn collect_call_optional_caller(
+		&self,
+		call: Node,
+		scope: &Scope,
+		caller: Option<&crate::call_graph::CallableId>,
+		contents: &str,
+		file_path: PathSymbol,
+	) {
+		use crate::call_graph::{CallType, CallableId};
+		use crate::utils::MinLoc;
+
+		let Some(func) = call.named_child(0) else {
+			return;
+		};
+
+		let call_location = MinLoc {
+			path: file_path,
+			range: crate::utils::span_conv(call.range()),
+		};
+
+		match func.kind() {
+			"identifier" => {
+				let func_name = &contents[func.byte_range()];
+				if func_name == "super" {
+					return;
+				}
+
+				if let Some(callee) = self.resolve_function_callee(func_name, scope, file_path) {
+					self.call_graph.add_call(
+						caller.cloned(),
+						callee,
+						call_location,
+						CallType::Direct,
+					);
+				}
+			}
+			"attribute" => {
+				let Some(method_node) = func.child_by_field_name("attribute") else {
+					return;
+				};
+				let Some(obj_node) = func.child_by_field_name("object") else {
+					return;
+				};
+				let method_name = &contents[method_node.byte_range()];
+
+				// At module level, we likely have things like odoo.api calls
+				// Try to resolve the object type
+				if let Some(tid) = self.type_of(obj_node, scope, contents) {
+					let type_ = type_cache().resolve(tid);
+					if let Some(model) = self.try_resolve_model(&type_, scope) {
+						let callee = CallableId::method(_R(model), method_name);
+						self.call_graph.add_call(
+							caller.cloned(),
+							callee,
+							call_location,
+							CallType::Direct,
+						);
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
 	#[inline]
 	pub fn type_display(&self, type_: TypeId) -> Option<String> {
 		self.type_display_indent(type_, 0)
@@ -1295,7 +1882,22 @@ impl Index {
 				let output = output.as_deref().unwrap_or("...");
 				Some(format!("Iterable[{output}]"))
 			}
-			Type::Method(..) => unreachable!("Bug: this function should not handle methods"),
+			Type::Union(types) => {
+				let mut parts: Vec<String> = types
+					.iter()
+					.filter_map(|t| self.type_display_indent(*t, indent))
+					.collect();
+				if parts.is_empty() {
+					None
+				} else {
+					// Sort for canonical representation (deterministic output)
+					parts.sort();
+					Some(parts.join(" | "))
+				}
+			}
+			Type::Method(model, method) => Some(format!("Method[{}, {}]", _R(model), method)),
+			Type::Function(path, name) => Some(format!("Function[{}, {}]", path, _R(name))),
+			Type::None => Some("None".into()),
 			Type::RefFn | Type::ModelFn(_) | Type::Super | Type::HttpRequest | Type::Value | Type::PythonMethod(..) => {
 				if cfg!(debug_assertions) {
 					Some(format!("{type_:?}"))
@@ -1394,8 +1996,7 @@ impl Index {
 			contents = test_utils::fs::read_to_string(location.path.to_path()).unwrap();
 			let rope = Rope::from_str(&contents);
 			end_offset = rope_conv(location.range.end, rope.slice(..));
-			let mut parser = Parser::new();
-			parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+			let mut parser = python_parser();
 			ast = parser.parse(contents.as_bytes(), None)?;
 			self.ast_cache.insert(
 				path,
@@ -1406,27 +2007,21 @@ impl Index {
 			);
 		}
 
-		// TODO: Improve this heuristic
-		fn is_toplevel_return(mut node: Node) -> bool {
-			while node.kind() != "function_definition" {
-				tracing::trace!("{}", node.kind());
-				match node.parent() {
-					Some(parent) => node = parent,
-					None => return false,
+		/// Checks if a return statement belongs to the given function scope,
+		/// not to a nested function definition.
+		fn is_return_in_function(return_node: Node, fn_scope: Node) -> bool {
+			let mut current = return_node;
+			while let Some(parent) = current.parent() {
+				if parent.id() == fn_scope.id() {
+					return true;
 				}
+				// If we hit another function_definition before our target, this return belongs to it
+				if parent.kind() == "function_definition" && parent.id() != fn_scope.id() {
+					return false;
+				}
+				current = parent;
 			}
-
-			fn is_block_of_class(node: Node) -> bool {
-				node.kind() == "block" && node.parent().is_some_and(|parent| parent.kind() == "class_definition")
-			}
-
-			if let Some(decoration) = node.parent()
-				&& decoration.kind() == "decorated_definition"
-			{
-				return decoration.parent().is_some_and(is_block_of_class);
-			}
-
-			node.parent().is_some_and(is_block_of_class)
+			false
 		}
 
 		let (self_type, fn_scope, self_param) = determine_scope(ast.root_node(), &contents, end_offset.0)?;
@@ -1436,23 +2031,40 @@ impl Index {
 		};
 		scope.super_ = Some(self_param.into());
 		scope.insert(self_param.to_string(), Type::Model(self_type.into()));
+		scope.current_path = Some(location.path);
+		
+		// Parse imports for resolving function calls
+		let imports = std::sync::Arc::new(parse_imports(ast.root_node(), &contents));
+		scope.imports = Some(imports);
+		
 		let offset = fn_scope.end_byte();
-		let (_, type_) = Self::walk_scope(fn_scope, Some(scope), |scope, node| {
-			let entered = self.build_scope(scope, node, offset, &contents).map_break(|_| None)?;
-			// TODO: When implementing freestanding functions, make the toplevel check optional
-			if node.kind() == "return_statement" && is_toplevel_return(node) {
-				let Some(child) = node.named_child(0) else {
-					return ControlFlow::Continue(entered);
-				};
-				let Some(type_) = self.type_of(child, scope, &contents) else {
-					return ControlFlow::Continue(entered);
-				};
 
-				let type_ = _TR!(type_);
-				return match self.try_resolve_model(type_, scope) {
-					Some(resolved) => ControlFlow::Break(Some(Type::Model(ImStr::from(_R(resolved))))),
-					None => ControlFlow::Break(Some(type_.clone())),
-				};
+		// Create caller ID for call graph
+		let caller = crate::call_graph::CallableId::method(_R(model), _R(method));
+		let call_path = location.path;
+
+		// Collect ALL return types instead of breaking on the first one
+		let mut return_types: Vec<TypeId> = Vec::new();
+
+		let _ = Self::walk_scope(fn_scope, Some(scope), |scope, node| {
+			let entered = self.build_scope(scope, node, offset, &contents).map_break(|_| None::<()>)?;
+
+			if node.kind() == "return_statement" && is_return_in_function(node, fn_scope) {
+				if let Some(child) = node.named_child(0)
+					&& let Some(type_) = self.type_of(child, scope, &contents)
+				{
+					let type_ = type_cache().resolve(type_);
+					let resolved = match self.try_resolve_model(type_, scope) {
+						Some(model) => _T!(Type::Model(ImStr::from(_R(model)))),
+						None => _T!(type_.clone()),
+					};
+					return_types.push(resolved);
+				}
+			}
+
+			// Collect calls for call hierarchy
+			if node.kind() == "call" && is_return_in_function(node, fn_scope) {
+				self.collect_call(node, scope, &caller, &contents, call_path);
 			}
 
 			ControlFlow::Continue(entered)
@@ -1494,14 +2106,200 @@ impl Index {
 		}
 
 		method.pending_eval.store(false, Ordering::Release);
-		if let Some(type_) = type_ {
-			let tid = _T!(type_);
+
+		// Unify all return types into a single type (potentially a Union)
+		if let Some(tid) = type_cache().union(return_types) {
 			method.eval_cache.insert(cache_key, tid);
 			Some(tid)
 		} else {
 			None
 		}
 	}
+	/// Evaluates the return type of a module-level function.
+	#[instrument(level = "trace", ret, skip(self), fields(func = _R(func), path = %path))]
+	pub fn eval_function_rtype(
+		&self,
+		func: Symbol<crate::model::Function>,
+		path: PathSymbol,
+	) -> Option<TypeId> {
+		
+
+		let funcs = self.functions.get(&path)?;
+		let func_obj = funcs.get(&func)?;
+
+		if func_obj
+			.pending_eval
+			.compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+			.is_err()
+		{
+			return None;
+		}
+
+		let location = func_obj.location.clone();
+		let func_path = path;
+		drop(funcs);
+
+		let _guard = Defer(Some(|| {
+			if let Some(funcs) = self.functions.get(&func_path)
+				&& let Some(func_obj) = funcs.get(&func)
+			{
+				func_obj.pending_eval.store(false, Ordering::Relaxed);
+			}
+		}));
+
+		// Check cache first
+		let empty_key: Vec<TypeId> = vec![];
+		if let Some(funcs) = self.functions.get(&path)
+			&& let Some(func_obj) = funcs.get(&func)
+			&& let Some(tid) = func_obj.eval_cache.get(&empty_key)
+		{
+			return Some(tid);
+		}
+
+		let ast;
+		let contents;
+		let file_path = location.path.to_path();
+
+		if let Some(cached) = self.ast_cache.get(&file_path) {
+			ast = cached.tree.clone();
+			contents = String::from(cached.rope.clone());
+		} else {
+			let Ok(file_contents) = test_utils::fs::read_to_string(file_path.clone()) else {
+				return None;
+			};
+			contents = file_contents;
+			let rope = Rope::from_str(&contents);
+			let mut parser = python_parser();
+			let Some(parsed_ast) = parser.parse(contents.as_bytes(), None) else {
+				return None;
+			};
+			ast = parsed_ast;
+			self.ast_cache.insert(
+				file_path,
+				Arc::new(crate::index::AstCacheItem {
+					tree: ast.clone(),
+					rope,
+				}),
+			);
+		}
+
+		// Find the function definition node
+		// Use end_offset - 1 to ensure we're inside the function body, not at the very end
+		let end_offset: ByteOffset = rope_conv(location.range.end, Rope::from_str(&contents).slice(..));
+		let search_offset = end_offset.0.saturating_sub(1);
+		let Some(fn_scope_start) = ast.root_node().descendant_for_byte_range(search_offset, search_offset) else {
+			return None;
+		};
+
+		// Walk up to find the function_definition
+		let fn_scope = {
+			let mut node = fn_scope_start;
+			loop {
+				if node.kind() == "function_definition" {
+					break node;
+				}
+				let Some(parent) = node.parent() else {
+					trace!("eval_function_rtype: no parent, couldn't find function_definition");
+					return None;
+				};
+				node = parent;
+			}
+		};
+
+		/// Checks if a return statement belongs to the given function scope,
+		/// not to a nested function definition.
+		fn is_return_in_function(return_node: Node, fn_scope: Node) -> bool {
+			let mut current = return_node;
+			while let Some(parent) = current.parent() {
+				if parent.id() == fn_scope.id() {
+					return true;
+				}
+				if parent.kind() == "function_definition" && parent.id() != fn_scope.id() {
+					return false;
+				}
+				current = parent;
+			}
+			false
+		}
+
+		let mut scope = Scope::default();
+		scope.current_path = Some(path);
+
+		// Parse imports for resolving function calls
+		let imports = std::sync::Arc::new(parse_imports(ast.root_node(), &contents));
+		scope.imports = Some(imports);
+
+		// Parse function parameters into scope
+		if let Some(params) = fn_scope.child_by_field_name("parameters") {
+			let mut cursor = params.walk();
+			for param in params.named_children(&mut cursor) {
+				if param.kind() == "identifier" {
+					let name = &contents[param.byte_range()];
+					scope.insert(name.to_string(), Type::Value);
+				} else if param.kind() == "default_parameter" {
+					if let Some(name_node) = param.named_child(0) {
+						let name = &contents[name_node.byte_range()];
+						// Try to infer type from default value
+						if let Some(value_node) = param.named_child(1)
+							&& let Some(type_) = self.type_of(value_node, &scope, &contents)
+						{
+							scope.insert(name.to_string(), type_cache().resolve(type_).clone());
+						} else {
+							scope.insert(name.to_string(), Type::Value);
+						}
+					}
+				}
+			}
+		}
+
+		let offset = fn_scope.end_byte();
+
+		// Create caller ID for call graph
+		let caller = crate::call_graph::CallableId::function(path.as_string(), _R(func));
+		let call_path = path;
+
+		// Collect ALL return types
+		let mut return_types: Vec<TypeId> = Vec::new();
+
+		let _ = Self::walk_scope(fn_scope, Some(scope), |scope, node| {
+			let entered = self.build_scope(scope, node, offset, &contents).map_break(|_| None::<()>)?;
+
+			if node.kind() == "return_statement" && is_return_in_function(node, fn_scope) {
+				if let Some(child) = node.named_child(0)
+					&& let Some(type_) = self.type_of(child, scope, &contents)
+				{
+					let type_ = type_cache().resolve(type_);
+					let resolved = match self.try_resolve_model(type_, scope) {
+						Some(model) => _T!(Type::Model(ImStr::from(_R(model)))),
+						None => _T!(type_.clone()),
+					};
+					return_types.push(resolved);
+				}
+			}
+
+			// Collect calls for call hierarchy
+			if node.kind() == "call" && is_return_in_function(node, fn_scope) {
+				self.collect_call(node, scope, &caller, &contents, call_path);
+			}
+
+			ControlFlow::Continue(entered)
+		});
+
+		// Cache and return the result
+		let result = type_cache().union(return_types);
+		if let Some(tid) = result {
+			if let dashmap::try_result::TryResult::Present(mut funcs) = self.functions.try_get_mut(&path) {
+				if let Some(func_arc) = funcs.get_mut(&func) {
+					let func_obj = Arc::make_mut(func_arc);
+					func_obj.eval_cache.insert(empty_key, tid);
+					func_obj.pending_eval.store(false, Ordering::Release);
+				}
+			}
+		}
+
+		result
+	}
+
 	/// `pattern` is `(identifier | pattern_list | tuple_pattern)`, the `a, b` in `for a, b in ...`.
 	fn destructure_into_patternlist_like(&self, pattern: Node, tid: TypeId, scope: &mut Scope, contents: &str) {
 		if pattern.kind() == "identifier" {
@@ -1587,17 +2385,16 @@ mod tests {
 	use pretty_assertions::assert_eq;
 	use ropey::Rope;
 	use tower_lsp_server::ls_types::Position;
-	use tree_sitter::{Parser, QueryCursor, StreamingIterator, StreamingIteratorMut};
+	use tree_sitter::{QueryCursor, StreamingIterator, StreamingIteratorMut};
 
 	use crate::analyze::{FieldCompletion, Type, type_cache};
 	use crate::index::_I;
-	use crate::utils::{ByteOffset, acc_vec, rope_conv};
+	use crate::utils::{ByteOffset, acc_vec, python_parser, rope_conv};
 	use crate::{index::Index, test_utils::cases::foo::prepare_foo_index};
 
 	#[test]
 	fn test_field_completion() {
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let contents = br#"
 class Foo(models.AbstractModel):
 	_name = 'foo'
@@ -1638,8 +2435,7 @@ class Foo(models.AbstractModel):
 
 	#[test]
 	fn test_determine_scope() {
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let contents = r#"
 class Foo(models.Model):
 	_name = 'foo'

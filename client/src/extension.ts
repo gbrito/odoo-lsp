@@ -223,7 +223,7 @@ function updateExtension(context: vscode.ExtensionContext, release: string) {
 							"No",
 							"Always",
 							"Never show again",
-					  );
+						);
 			if (resp === "Always") extensionState.nightlyExtensionUpdates = "always";
 			else if (resp === "Never show again") extensionState.nightlyExtensionUpdates = "never";
 
@@ -378,6 +378,7 @@ export async function activate(context: vscode.ExtensionContext) {
 			{ language: "xml", scheme: "file" },
 			{ language: "python", scheme: "file" },
 			{ language: "javascript", scheme: "file" },
+			{ language: "csv", scheme: "file" },
 		],
 		outputChannel: binaryOutputChannel,
 		traceOutputChannel,

@@ -64,6 +64,9 @@ async fn fixture_test(#[files("fixtures/*")] root: PathBuf) -> ExitCode {
 			|| !expected.r#type.is_empty()
 			|| !expected.def.is_empty()
 			|| !expected.related.is_empty()
+			|| !expected.symbol.is_empty()
+			|| !expected.hint.is_empty()
+			|| !expected.token.is_empty()
 	});
 
 	// <!> compare and run
@@ -339,7 +342,219 @@ async fn fixture_test(#[files("fixtures/*")] root: PathBuf) -> ExitCode {
 					})
 					.collect();
 
-				let mut items = completions.chain(types).chain(definitions);
+				// Document symbols test
+				if !expected.symbol.is_empty() {
+					let symbols_result = server
+						.document_symbol(DocumentSymbolParams {
+							text_document: TextDocumentIdentifier { uri: uri.clone() },
+							work_done_progress_params: Default::default(),
+							partial_result_params: Default::default(),
+						})
+						.await;
+
+					match symbols_result {
+						Ok(Some(DocumentSymbolResponse::Nested(symbols))) => {
+							let actual_names = collect_symbol_names(&symbols);
+							for expected_name in &expected.symbol {
+								if !actual_names.iter().any(|n| n.contains(expected_name)) {
+									diffs.push(format!(
+										"[symbol] in {}\n\nExpected symbol '{}' not found.\nActual symbols: {:?}",
+										path.display(),
+										expected_name,
+										actual_names
+									));
+								}
+							}
+						}
+						Ok(Some(DocumentSymbolResponse::Flat(symbols))) => {
+							let actual_names: Vec<_> = symbols.iter().map(|s| s.name.clone()).collect();
+							for expected_name in &expected.symbol {
+								if !actual_names.iter().any(|n| n.contains(expected_name)) {
+									diffs.push(format!(
+										"[symbol] in {}\n\nExpected symbol '{}' not found.\nActual symbols: {:?}",
+										path.display(),
+										expected_name,
+										actual_names
+									));
+								}
+							}
+						}
+						Ok(None) => {
+							diffs.push(format!(
+								"[symbol] in {}\n\nNo symbols returned, expected: {:?}",
+								path.display(),
+								expected.symbol
+							));
+						}
+						Err(e) => {
+							diffs.push(format!(
+								"[symbol] in {}\n\nFailed to get symbols: {:?}",
+								path.display(),
+								e
+							));
+						}
+					}
+				}
+
+				// Inlay hints test
+				let hints: FuturesUnordered<_> = expected
+					.hint
+					.iter()
+					.map(|(position, expected_hint)| {
+						let mut server = server.clone();
+						let uri = uri.clone();
+						let path = path.display();
+						let position = *position;
+						let expected_hint = expected_hint.clone();
+						async move {
+							// Request hints for a small range around the position
+							let range = Range {
+								start: Position {
+									line: position.line.saturating_sub(1),
+									character: 0,
+								},
+								end: Position {
+									line: position.line + 2,
+									character: 0,
+								},
+							};
+							let hints_result = server
+								.inlay_hint(InlayHintParams {
+									text_document: TextDocumentIdentifier { uri },
+									range,
+									work_done_progress_params: Default::default(),
+								})
+								.await;
+
+							match hints_result {
+								Ok(Some(hints)) => {
+									// Find a hint at or near the expected position
+									let matching_hint = hints.iter().find(|hint| {
+										hint.position.line == position.line
+											&& hint.position.character >= position.character
+									});
+
+									if let Some(hint) = matching_hint {
+										let label = match &hint.label {
+											InlayHintLabel::String(s) => s.clone(),
+											InlayHintLabel::LabelParts(parts) => {
+												parts.iter().map(|p| p.value.as_str()).collect()
+											}
+										};
+										// Check if the hint contains the expected text
+										if !label.contains(&expected_hint) {
+											format!(
+												"[hint] in {path}:{}:{}\n\nExpected hint containing '{}', got '{}'",
+												position.line + 1,
+												position.character + 1,
+												expected_hint,
+												label
+											)
+										} else {
+											String::new()
+										}
+									} else {
+										format!(
+											"[hint] in {path}:{}:{}\n\nNo hint found at position, expected '{}'.\nAvailable hints: {:?}",
+											position.line + 1,
+											position.character + 1,
+											expected_hint,
+											hints.iter().map(|h| format!("{}:{} - {:?}", h.position.line, h.position.character, h.label)).collect::<Vec<_>>()
+										)
+									}
+								}
+								Ok(None) => {
+									format!(
+										"[hint] in {path}:{}:{}\n\nNo hints returned, expected '{}'",
+										position.line + 1,
+										position.character + 1,
+										expected_hint
+									)
+								}
+								Err(e) => {
+									format!(
+										"[hint] in {path}:{}:{}\n\nFailed to get hints: {:?}",
+										position.line + 1,
+										position.character + 1,
+										e
+									)
+								}
+							}
+						}
+					})
+					.collect();
+
+				// Semantic tokens test
+				if !expected.token.is_empty() {
+					let _rope = odoo_lsp::prelude::Rope::from_str(&std::fs::read_to_string(&path).unwrap_or_default());
+					let tokens_result = server
+						.semantic_tokens_full(SemanticTokensParams {
+							text_document: TextDocumentIdentifier { uri: uri.clone() },
+							work_done_progress_params: Default::default(),
+							partial_result_params: Default::default(),
+						})
+						.await;
+
+					match tokens_result {
+						Ok(Some(SemanticTokensResult::Tokens(tokens))) => {
+							// Decode delta-encoded tokens to absolute positions
+							let decoded = decode_semantic_tokens(&tokens.data);
+
+							for (position, expected_type) in &expected.token {
+								let matching_token = decoded.iter().find(|t| {
+									t.line == position.line
+										&& t.start_char <= position.character
+										&& position.character < t.start_char + t.length
+								});
+
+								if let Some(token) = matching_token {
+									let actual_type = token_type_name(token.token_type);
+									if actual_type != expected_type {
+										diffs.push(format!(
+											"[token] in {}:{}:{}\n\nExpected token type '{}', got '{}'",
+											path.display(),
+											position.line + 1,
+											position.character + 1,
+											expected_type,
+											actual_type
+										));
+									}
+								} else {
+									diffs.push(format!(
+										"[token] in {}:{}:{}\n\nNo token found at position, expected '{}'.\nAvailable tokens: {:?}",
+										path.display(),
+										position.line + 1,
+										position.character + 1,
+										expected_type,
+										decoded.iter().map(|t| format!("{}:{}-{} {}", t.line, t.start_char, t.start_char + t.length, token_type_name(t.token_type))).collect::<Vec<_>>()
+									));
+								}
+							}
+						}
+						Ok(Some(SemanticTokensResult::Partial(_))) => {
+							diffs.push(format!(
+								"[token] in {}\n\nGot partial result, expected full tokens",
+								path.display()
+							));
+						}
+						Ok(None) => {
+							diffs.push(format!(
+								"[token] in {}\n\nNo tokens returned, expected: {:?}",
+								path.display(),
+								expected.token
+							));
+						}
+						Err(e) => {
+							diffs.push(format!(
+								"[token] in {}\n\nFailed to get tokens: {:?}",
+								path.display(),
+								e
+							));
+						}
+					}
+				}
+
+				let mut items = completions.chain(types).chain(definitions).chain(hints);
 				while let Some(diff) = items.next().await {
 					diffs.push(diff);
 				}
@@ -384,6 +599,15 @@ query! {
 
 	((comment) @related
 	(#match? @related "\\^related "))
+
+	((comment) @symbol
+	(#match? @symbol "\\^symbol "))
+
+	((comment) @hint
+	(#match? @hint "\\^hint "))
+
+	((comment) @token
+	(#match? @token "\\^token "))
 }
 
 fn xml_query() -> &'static Query {
@@ -394,6 +618,12 @@ fn xml_query() -> &'static Query {
 
 		((Comment) @complete
 		(#match? @complete "\\^complete "))
+
+		((Comment) @hint
+		(#match? @hint "\\^hint "))
+
+		((Comment) @symbol
+		(#match? @symbol "\\^symbol "))
 
 		((Comment) @type
 		(#match? @type "\\^type "))
@@ -423,6 +653,9 @@ struct Expected {
 	r#type: Vec<(Position, String)>,
 	def: Vec<Position>,
 	related: Vec<(Position, String)>,
+	symbol: Vec<String>,
+	hint: Vec<(Position, String)>,
+	token: Vec<(Position, String)>,
 }
 
 enum TestLanguages {
@@ -603,6 +836,23 @@ fn process_assertions(expected: &mut Expected, assertions: Vec<ParsedAssertion>)
 				last_non_related_position = Some(position);
 				i += 1;
 			}
+			"symbol" => {
+				// Symbol assertions are file-level, listing expected symbol names
+				expected.symbol.push(assertion.value.clone());
+				i += 1;
+			}
+			"hint" => {
+				// Hint assertions check for inlay hint at specific position
+				expected.hint.push((position, assertion.value.clone()));
+				last_non_related_position = Some(position);
+				i += 1;
+			}
+			"token" => {
+				// Token assertions check for semantic token at specific position
+				expected.token.push((position, assertion.value.clone()));
+				last_non_related_position = Some(position);
+				i += 1;
+			}
 			"related" => {
 				// For consecutive related assertions, they should all point to the same position
 				// which is the position of the last non-related assertion
@@ -645,5 +895,70 @@ fn process_assertions(expected: &mut Expected, assertions: Vec<ParsedAssertion>)
 				i += 1;
 			}
 		}
+	}
+}
+
+/// Recursively collect all symbol names from a nested DocumentSymbol tree
+fn collect_symbol_names(symbols: &[DocumentSymbol]) -> Vec<String> {
+	let mut names = Vec::new();
+	for symbol in symbols {
+		names.push(symbol.name.clone());
+		if let Some(children) = &symbol.children {
+			names.extend(collect_symbol_names(children));
+		}
+	}
+	names
+}
+
+/// Decoded semantic token with absolute positions
+#[derive(Debug)]
+struct DecodedToken {
+	line: u32,
+	start_char: u32,
+	length: u32,
+	token_type: u32,
+	#[allow(dead_code)]
+	modifiers: u32,
+}
+
+/// Decode delta-encoded semantic tokens to absolute positions
+fn decode_semantic_tokens(tokens: &[SemanticToken]) -> Vec<DecodedToken> {
+	let mut decoded = Vec::with_capacity(tokens.len());
+	let mut prev_line = 0u32;
+	let mut prev_start = 0u32;
+
+	for token in tokens {
+		let line = prev_line + token.delta_line;
+		let start_char = if token.delta_line == 0 {
+			prev_start + token.delta_start
+		} else {
+			token.delta_start
+		};
+
+		decoded.push(DecodedToken {
+			line,
+			start_char,
+			length: token.length,
+			token_type: token.token_type,
+			modifiers: token.token_modifiers_bitset,
+		});
+
+		prev_line = line;
+		prev_start = start_char;
+	}
+
+	decoded
+}
+
+/// Map token type index to name (must match server.rs legend order)
+fn token_type_name(index: u32) -> &'static str {
+	match index {
+		0 => "CLASS",
+		1 => "PROPERTY",
+		2 => "METHOD",
+		3 => "DECORATOR",
+		4 => "TYPE",
+		5 => "STRING",
+		_ => "UNKNOWN",
 	}
 }

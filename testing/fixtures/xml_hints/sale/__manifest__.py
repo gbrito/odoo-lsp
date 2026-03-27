@@ -1,0 +1,1 @@
+{"name": "sale", "depends": ["base"]}

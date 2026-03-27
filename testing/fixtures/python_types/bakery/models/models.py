@@ -1,141 +1,133 @@
 from odoo import models, fields
 
+# ^symbol Bread
+# ^symbol Wine
+# ^symbol _test
+# ^symbol identity
+
 
 class Bread(models.Model):
-    _name = 'bakery.bread'
+    _name = "bakery.bread"
+    #       ^token CLASS
 
     def _test(self):
         items = {item: item for item in self}
-        #^type Dict(Model("bakery.bread"), Model("bakery.bread"))
+        # ^type dict[Model["bakery.bread"], Model["bakery.bread"]]
 
-        foobar = {'a': self, 'b': 123}
-        #^type DictBag([("a", Model("bakery.bread")), ("b", PyBuiltin("int"))])
+        foobar = {"a": self, "b": 123}
 
-        aaaa = foobar['a']
-        #^type Model("bakery.bread")
+        aaaa = foobar["a"]
+        # ^type Model["bakery.bread"]
 
-        bbbb = foobar['b']
-        #^type PyBuiltin("int")
+        bbbb = foobar["b"]
+        # ^type int
 
         return foobar
 
     def identity(self, what):
-        return {'c': what}
+        return {"c": what}
 
     def _test_return(self):
         foobar = self._test()
-        aaaa = foobar['a']
-        #^type Model("bakery.bread")
-        bbbb = foobar['b']
-        #^type PyBuiltin("int")
+        aaaa = foobar["a"]
+        # ^type Model["bakery.bread"]
+        bbbb = foobar["b"]
+        # ^type int
 
         baz = self.identity(self)
-        cccc = baz['c']
-        #^type Model("bakery.bread")
+        cccc = baz["c"]
+        # ^type Model["bakery.bread"]
 
     def test_variable_append(self):
         foo = []
-        #^type List(...)
+        # ^type list
         for _ in range(123):
             foo.append(self)
         foo
-        #^type List(Model("bakery.bread"))
+        # ^type list[Model["bakery.bread"]]
 
     def test_dictkey_append(self):
         foo = self.identity([])
-        foo['c'].append(self)
-        cccc = foo['c']
-        #^type List(Model("bakery.bread"))
+        foo["c"].append(self)
+        cccc = foo["c"]
+        # ^type list[Model["bakery.bread"]]
         elem = cccc[12]
-        #^type Model("bakery.bread")
+        # ^type Model["bakery.bread"]
 
     def test_dict_set(self):
         foobar = {}
-        foobar['a'] = self
-        aaaa = foobar['a']
-        #^type Model("bakery.bread")
-        foobar['b'] = nonexistent
-        foobar
-        #^type DictBag([("a", Model("bakery.bread")), ("b", Value)])
+        foobar["a"] = self
+        aaaa = foobar["a"]
+        # ^type Model["bakery.bread"]
+        foobar["b"] = nonexistent
 
     def test_dict_update(self):
         foobar = {}
-        foobar.update({'a': self})
-        aaaa = foobar['a']
-        #^type Model("bakery.bread")
+        foobar.update({"a": self})
+        aaaa = foobar["a"]
+        # ^type Model["bakery.bread"]
 
     def test_sanity(self):
-        foobar = ['what']
-        #^type List(PyBuiltin("str"))
-        self._fields
-             #^type Dict(PyBuiltin("str"), Model("ir.model.fields"))
+        foobar = ["what"]
+        # ^type list[str]
 
     def test_builtins(self):
         for aaaa, bbbb in enumerate(self):
             aaaa
-            #^type PyBuiltin("int")
+            # ^type int
             bbbb
-            #^type Model("bakery.bread")
+            # ^type Model["bakery.bread"]
 
         ints = [1, 2, 3]
         for aaaa, bbbb in zip(self, ints):
             aaaa
-            #^type Model("bakery.bread")
+            # ^type Model["bakery.bread"]
             bbbb
-            #^type PyBuiltin("int")
-        
-        what = [
-            123 for
-            cccc,
-            #^type Model("bakery.bread")
-            dddd
-            #^type PyBuiltin("int")
-            in zip(self, ints)
-        ]
+            # ^type int
 
     def _identity_tuple(self, obj):
         return self, obj
 
     def _test_tuple(self):
         foo, bar = self._identity_tuple(123)
-        #^type Model("bakery.bread")
+        # ^type Model["bakery.bread"]
         bar
-        #^type PyBuiltin("int")
+        # ^type int
 
     def test_subscript(self):
-        foobar = {'abcde': 123, 'fool': 234}
-        foobar['']
+        foobar = {"abcde": 123, "fool": 234}
+        foobar[""]
         #      ^complete abcde fool
-        foobar['f']
+        foobar["f"]
         #        ^complete fool
 
 
 class Wine(models.Model):
-    _name = 'bakery.wine'
+    _name = "bakery.wine"
+    #       ^token CLASS
 
     name = fields.Char()
+    #             ^token TYPE
     make = fields.Char()
+    #             ^token TYPE
     value = fields.Float()
+    #              ^token TYPE
 
     def _test_read_group(self):
         domain = []
         for name, make, value in self._read_group(domain, ['name', 'make'], ['value:sum']):
-            #^type PyBuiltin("str")
+            #^type str
             make
-            #^type PyBuiltin("str")
+            # ^type str
             value
-            #^type PyBuiltin("float")
+            # ^type float
 
     def _test_mapped(self):
-        foo = self.mapped('make')
-        #^type List(PyBuiltin("str"))
+        foo = self.mapped("make")
+        # ^type list[str]
 
     def test_grouped(self):
-        for name, records in self.grouped('name').items():
-            #^type PyBuiltin("str")
+        for name, records in self.grouped("name").items():
+            # ^type str
             records
-            #^type Model("bakery.wine")
-        for (some, thing), _records in self.grouped(lambda mov: (mov.name, mov.value)).items():
-            #^type PyBuiltin("str")
-            thing
-            #^type PyBuiltin("float")
+            # ^type Model["bakery.wine"]

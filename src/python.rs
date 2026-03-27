@@ -1,12 +1,12 @@
 use std::borrow::Cow;
+use std::ops::Deref;
 use std::path::Path;
-use std::str::FromStr;
 
 use lasso::Spur;
 use ropey::Rope;
 use tower_lsp_server::ls_types::*;
 use tracing::{debug, instrument, trace, warn};
-use tree_sitter::{Node, Parser, QueryCapture, QueryMatch};
+use tree_sitter::{Node, QueryCapture, QueryMatch};
 use ts_macros::query;
 
 use crate::prelude::*;
@@ -21,6 +21,9 @@ use std::collections::HashMap;
 
 mod completions;
 mod diagnostics;
+mod inlay_hints;
+mod semantic_tokens;
+mod symbols;
 
 #[cfg(test)]
 mod tests;
@@ -130,7 +133,7 @@ query! {
       (decorator
         (call
           (attribute (identifier) @_api (identifier) @_depends)
-          (argument_list ((string) @MAPPED ","?)*)))
+          (argument_list ((string) @_ ","?)*)))
       (function_definition) @SCOPE) ]))
   (#eq? @_api "api")
   (#eq? @_depends "depends"))
@@ -166,18 +169,18 @@ query! {
     alias: (identifier) @IMPORT_ALIAS))
 }
 
-/// Field descriptors that we are interested in providing support.
-#[derive(derive_more::FromStr, Clone, Copy)]
-#[from_str(rename_all = "snake_case")]
-enum FieldDescriptors {
-	ComodelName,
-	Domain,
-	Compute,
-	Inverse,
-	Search,
-	InverseName,
-	Related,
-	Groups,
+#[rustfmt::skip]
+query! {
+	ModuleFunction(FuncName, FuncBody);
+
+(module
+  (function_definition
+    name: (identifier) @FUNC_NAME) @FUNC_BODY)
+
+(module
+  (decorated_definition
+    (function_definition
+      name: (identifier) @FUNC_NAME)) @FUNC_BODY)
 }
 
 /// (module (_)*)
@@ -185,6 +188,18 @@ pub(crate) fn top_level_stmt(module: Node, offset: usize) -> Option<Node> {
 	module
 		.named_children(&mut module.walk())
 		.find(|child| child.byte_range().contains_end(offset))
+}
+
+/// Get the top-level statement (direct child of module) containing the given node.
+fn top_level_stmt_of_node(node: Node) -> Option<Node> {
+	let mut current = node;
+	while let Some(parent) = current.parent() {
+		if parent.kind() == "module" {
+			return Some(current);
+		}
+		current = parent;
+	}
+	None
 }
 
 /// Recursively searches for a class definition with the given name in the AST.
@@ -268,15 +283,12 @@ impl Backend {
 			debug!("Looking for class '{}' in target file", class_name);
 		}
 
-		let mut target_parser = Parser::new();
-		target_parser
-			.set_language(&tree_sitter_python::LANGUAGE.into())
-			.map_err(|e| anyhow::anyhow!("Failed to set parser language: {}", e))?;
+		let mut target_parser = python_parser();
 
 		let Some(target_ast) = target_parser.parse(&target_contents, None) else {
 			debug!("Failed to parse target file with tree-sitter");
 			return Ok(Some(Location {
-				uri: Uri::from_file_path(file_path).unwrap(),
+				uri: path_to_uri(file_path)?,
 				range: Range::new(Position::new(0, 0), Position::new(0, 0)),
 			}));
 		};
@@ -295,7 +307,7 @@ impl Backend {
 				);
 			}
 			return Ok(Some(Location {
-				uri: Uri::from_file_path(file_path).unwrap(),
+				uri: path_to_uri(file_path)?,
 				range: span_conv(range),
 			}));
 		}
@@ -309,7 +321,7 @@ impl Backend {
 			debug!("Class '{}' not found in target file using tree-sitter", class_name);
 		}
 		Ok(Some(Location {
-			uri: Uri::from_file_path(file_path).unwrap(),
+			uri: path_to_uri(file_path)?,
 			range: Range::new(Position::new(0, 0), Position::new(0, 0)),
 		}))
 	}
@@ -322,18 +334,13 @@ impl Backend {
 		rope: RopeSlice<'_>,
 		old_rope: Option<Rope>,
 	) -> anyhow::Result<()> {
-		let mut parser = Parser::new();
-		parser
-			.set_language(&tree_sitter_python::LANGUAGE.into())
-			.expect("bug: failed to init python parser");
+		let parser = python_parser();
 		self.update_ast(text, uri, rope, old_rope, parser)
 	}
 
 	/// Parse import statements from Python content and return a map of imported names to their module paths
 	fn parse_imports(&self, contents: &str) -> anyhow::Result<ImportMap> {
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
-
+		let mut parser = python_parser();
 		let ast = parser
 			.parse(contents, None)
 			.ok_or_else(|| errloc!("Failed to parse Python AST"))?;
@@ -393,14 +400,22 @@ impl Backend {
 		Ok(imports)
 	}
 	pub fn update_models(&self, text: Text, path: &Path, root: Spur, rope: Rope) -> anyhow::Result<()> {
+		use crate::index::index_functions;
+		use crate::model::Function;
+
 		let text = match text {
 			Text::Full(text) => Cow::from(text),
 			// TODO: Limit range of possible updates based on delta
 			Text::Delta(_) => Cow::from(rope.slice(..)),
 		};
+		let path_sym = PathSymbol::strip_root(root, path);
+
+		// Clear call graph data for this file before re-indexing
+		self.index.call_graph.clear_file(path_sym);
+
+		// Index models
 		let models = index_models(text.as_bytes())?;
-		let path = PathSymbol::strip_root(root, path);
-		self.index.models.append(path, true, &models);
+		self.index.models.append(path_sym, true, &models);
 		for model in models {
 			match model.type_ {
 				ModelType::Base { name, ancestors } => {
@@ -415,19 +430,32 @@ impl Backend {
 						.ancestors
 						.extend(ancestors.into_iter().map(|sym| ModelName::from(_I(&sym))));
 					drop(entry);
-					self.index.models.populate_properties(model_key.into(), &[path]);
+					self.index.models.populate_properties(model_key.into(), &[path_sym]);
 				}
 				ModelType::Inherit(inherits) => {
 					let Some(model) = inherits.first() else { continue };
 					let model_key = _G(model).unwrap();
-					self.index.models.populate_properties(model_key.into(), &[path]);
+					self.index.models.populate_properties(model_key.into(), &[path_sym]);
 				}
 			}
 		}
+
+		// Index module-level functions
+		if let Ok(functions) = index_functions(text.as_bytes(), path_sym) {
+			self.index.functions.clear_file(&path_sym);
+			self.index.functions.append(
+				path_sym,
+				functions.into_iter().map(|f| {
+					let name_sym: Symbol<Function> = _I(&f.name).into();
+					(name_sym, f.location)
+				}),
+			);
+		}
+
 		Ok(())
 	}
 	pub async fn did_save_python(&self, uri: Uri, root: Spur) -> anyhow::Result<()> {
-		let path = uri.to_file_path().unwrap();
+		let path = uri_to_path(&uri)?;
 		let zone;
 		_ = {
 			let mut document = self
@@ -445,7 +473,7 @@ impl Backend {
 			{
 				let mut document = self.document_map.get_mut(uri.path().as_str()).unwrap();
 				let rope = document.rope.clone();
-				let file_path = uri.to_file_path().unwrap();
+				let file_path = uri_to_path(&uri)?;
 				self.diagnose_python(
 					file_path.to_str().unwrap(),
 					rope.slice(..),
@@ -496,8 +524,14 @@ impl Backend {
 		single_field_override: Option<bool>,
 	) -> Option<Mapped<'text>> {
 		let mut needle = if for_replacing {
+			if range.len() < 2 {
+				return None;
+			}
 			range = range.shrink(1);
 			let offset = offset.unwrap_or(range.end);
+			// If the offset is before the shrunk range start, clamp it to the start.
+			// This handles cases where the cursor is at the opening quote of a string.
+			let offset = offset.max(range.start);
 			&contents[range.start..offset]
 		} else {
 			let slice = &contents[range.clone().shrink(1)];
@@ -528,8 +562,16 @@ impl Backend {
 
 		let model;
 		if let Some(local_model) = match_.nodes_for_capture_index(PyCompletions::MappedTarget as _).next() {
-			let model_ = (self.index).model_of_range(root, local_model.byte_range().map_unit(ByteOffset), contents)?;
-			model = _R(model_);
+			// Try to resolve the model from the target expression
+			if let Some(model_) = (self.index).model_of_range(root, local_model.byte_range().map_unit(ByteOffset), contents) {
+				model = _R(model_);
+			} else if let Some(this_model) = &this_model {
+				// Fall back to this_model if we can't resolve the target
+				// This handles cases like Command.create({}) where Command is not a model
+				model = this_model;
+			} else {
+				return None;
+			}
 		} else if let Some(this_model) = &this_model {
 			model = this_model
 		} else {
@@ -572,7 +614,7 @@ impl Backend {
 		rope: RopeSlice<'_>,
 	) -> anyhow::Result<Option<Location>> {
 		let uri = &params.text_document_position_params.text_document.uri;
-		let file_path = uri.to_file_path().unwrap();
+		let file_path = uri_to_path(uri)?;
 		let file_path_str = file_path.to_str().unwrap();
 		let ast = self
 			.ast_map
@@ -643,7 +685,10 @@ impl Backend {
 						// 	.next()
 						// 	.is_none()
 						{
-							this_model.tag_model(capture.node, match_, root.byte_range(), &contents);
+							let capture_top_level = top_level_stmt_of_node(capture.node)
+								.map(|n| n.byte_range())
+								.unwrap_or_else(|| root.byte_range());
+							this_model.tag_model(capture.node, match_, capture_top_level, &contents);
 						}
 					}
 					Some(PyCompletions::Mapped) => {
@@ -682,61 +727,63 @@ impl Backend {
 						}
 					}
 					Some(PyCompletions::FieldDescriptor) => {
-						use FieldDescriptors as FD;
 						let Some(desc_value) = python_next_named_sibling(capture.node) else {
 							continue;
 						};
+
+						let descriptor = &contents[capture.node.byte_range()];
 						if !desc_value.byte_range().contains_end(offset) {
 							continue;
 						}
-
-						match FD::from_str(&contents[range]) {
-							Ok(FD::ComodelName) => {
-								let range = desc_value.byte_range().shrink(1);
-								let slice = ok!(rope.try_slice(range.clone()));
-								let slice = Cow::from(slice);
-								return self.index.jump_def_model(&slice);
+						if matches!(descriptor, "comodel_name") {
+							let range = desc_value.byte_range().shrink(1);
+							let slice = ok!(rope.try_slice(range.clone()));
+							let slice = Cow::from(slice);
+							return self.index.jump_def_model(&slice);
+						} else if matches!(descriptor, "compute" | "search" | "inverse" | "related" | "inverse_name") {
+							let single_field = matches!(descriptor, "related" | "inverse_name");
+							let mapped_model = if descriptor == "inverse_name" {
+								extract_comodel_name(match_.captures, &contents)
+									.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
+							} else {
+								this_model.inner
+							};
+							// same as PyCompletions::Mapped
+							let Some(mapped) = self.gather_mapped(
+								root,
+								match_,
+								Some(offset),
+								desc_value.byte_range(),
+								mapped_model,
+								&contents,
+								false,
+								Some(single_field),
+							) else {
+								break;
+							};
+							let mut needle = mapped.needle;
+							let mut model = _I(mapped.model);
+							if !mapped.single_field {
+								some!(self.index.models.resolve_mapped(&mut model, &mut needle, None).ok());
 							}
-							Ok(
-								descriptor @ (FD::Compute | FD::Search | FD::Inverse | FD::Related | FD::InverseName),
-							) => {
-								let single_field = matches!(descriptor, FD::Related | FD::InverseName);
-								let mapped_model = if matches!(descriptor, FD::InverseName) {
-									extract_comodel_name(match_.captures, &contents)
-										.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
-								} else {
-									this_model.inner
-								};
-								// same as PyCompletions::Mapped
-								let Some(mapped) = self.gather_mapped(
-									root,
-									match_,
-									Some(offset),
-									desc_value.byte_range(),
-									mapped_model,
-									&contents,
-									false,
-									Some(single_field),
-								) else {
-									break;
-								};
-								let mut needle = mapped.needle;
-								let mut model = _I(mapped.model);
-								if !mapped.single_field {
-									some!(self.index.models.resolve_mapped(&mut model, &mut needle, None).ok());
-								}
-								let model = _R(model);
-								return self.index.jump_def_property_name(needle, model);
-							}
-							Ok(FD::Groups) => {
-								let range = desc_value.byte_range().shrink(1);
-								let value = Cow::from(ok!(rope.try_slice(range.clone())));
-								let mut ref_ = None;
-								determine_csv_xmlid_subgroup(&mut ref_, (&value, range), offset);
-								let (needle, _) = some!(ref_);
-								return self.index.jump_def_xml_id(needle, uri);
-							}
-							Ok(FD::Domain) | Err(_) => {}
+							let model = _R(model);
+							return self.index.jump_def_property_name(needle, model);
+						} else if matches!(descriptor, "groups") {
+							let range = desc_value.byte_range().shrink(1);
+							let value = Cow::from(ok!(rope.try_slice(range.clone())));
+							let mut ref_ = None;
+							determine_csv_xmlid_subgroup(&mut ref_, (&value, range), offset);
+							let (needle, _) = some!(ref_);
+							return self.index.jump_def_xml_id(needle, uri);
+						} else if matches!(descriptor, "definition") {
+							// Go to definition for Properties definition path
+							// Format: "many2one_field.properties_definition_field"
+							return self.goto_def_properties_definition(
+								desc_value,
+								offset,
+								this_model.inner,
+								&contents,
+							);
 						}
 
 						return Ok(None);
@@ -756,9 +803,159 @@ impl Backend {
 			}
 		}
 
+		// First check if the cursor is on an attribute of Type::Env
+		if let Some((lhs, attr, _range)) = Self::attribute_node_at_offset(offset, root, &contents) {
+			if let Some((tid, _scope)) =
+				self.index.type_of_range(root, lhs.byte_range().map_unit(ByteOffset), &contents)
+			{
+				if matches!(type_cache().resolve(tid), Type::Env) {
+					return self.index.jump_def_env_attribute(attr);
+				}
+			}
+		}
+
 		let (model, prop, _) = some!(self.attribute_at_offset(offset, root, &contents));
 		self.index.jump_def_property_name(prop, model)
 	}
+
+	/// Go to definition for Properties field `definition` parameter.
+	/// The definition path has format: "many2one_field.properties_definition_field"
+	/// Based on cursor position, jumps to either:
+	/// - The Many2one field definition (if cursor is on the first part)
+	/// - The PropertiesDefinition field definition on the comodel (if cursor is after the dot)
+	fn goto_def_properties_definition(
+		&self,
+		desc_value: Node<'_>,
+		offset: usize,
+		model: Option<&str>,
+		contents: &str,
+	) -> anyhow::Result<Option<Location>> {
+		use crate::model::FieldKind;
+
+		let range = desc_value.byte_range().shrink(1);
+		let value = &contents[range.clone()];
+
+		// Parse the definition path: "m2o_field.propdef_field"
+		let Some(dot_pos) = value.find('.') else {
+			// If there's no dot, we can only try to resolve the field on the current model
+			let model_name = some!(model);
+			let model_key = some!(_G(model_name));
+			let entry = some!(self.index.models.populate_properties(model_key.into(), &[]));
+			let fields = some!(entry.fields.as_ref());
+			let field_key = some!(_G(value));
+			let field = some!(fields.get(&field_key));
+			return Ok(Some(field.location.deref().clone().into()));
+		};
+
+		let m2o_field = &value[..dot_pos];
+		let propdef_field = &value[dot_pos + 1..];
+
+		// Calculate which part the cursor is on
+		let relative_offset = offset - range.start;
+		let cursor_on_m2o = relative_offset <= dot_pos;
+
+		let model_name = some!(model);
+		let model_key = some!(_G(model_name));
+
+		// Get field info and comodel in a block to release the lock before getting comodel entry
+		let comodel = {
+			let entry = some!(self.index.models.populate_properties(model_key.into(), &[]));
+			let fields = some!(entry.fields.as_ref());
+			let m2o_field_key = some!(_G(m2o_field));
+			let m2o_field_entry = some!(fields.get(&m2o_field_key));
+
+			if cursor_on_m2o {
+				// Cursor is on the Many2one field part - jump to its definition
+				return Ok(Some(m2o_field_entry.location.deref().clone().into()));
+			}
+
+			// Extract the comodel and location before dropping the lock
+			let comodel = match &m2o_field_entry.kind {
+				FieldKind::Relational(comodel) => *comodel,
+				FieldKind::Value | FieldKind::Related(_) => {
+					return Ok(None);
+				}
+			};
+			comodel
+		};
+		// Lock is now released
+
+		// Get the PropertiesDefinition field on the comodel
+		let comodel_entry = some!(self.index.models.populate_properties(comodel.into(), &[]));
+		let comodel_fields = some!(comodel_entry.fields.as_ref());
+		let propdef_field_key = some!(_G(propdef_field));
+		let propdef_entry = some!(comodel_fields.get(&propdef_field_key));
+
+		Ok(Some(propdef_entry.location.deref().clone().into()))
+	}
+
+	/// Hover for Properties field `definition` parameter.
+	/// The definition path has format: "many2one_field.properties_definition_field"
+	/// Based on cursor position, shows hover for either:
+	/// - The Many2one field (if cursor is on the first part before the dot)
+	/// - The PropertiesDefinition field on the comodel (if cursor is after the dot)
+	fn hover_properties_definition(
+		&self,
+		desc_value: Node<'_>,
+		offset: usize,
+		model: Option<&str>,
+		contents: &str,
+		rope: RopeSlice<'_>,
+	) -> anyhow::Result<Option<Hover>> {
+		use crate::model::FieldKind;
+
+		let range = desc_value.byte_range().shrink(1);
+		let value = &contents[range.clone()];
+
+		// Parse the definition path: "m2o_field.propdef_field"
+		let Some(dot_pos) = value.find('.') else {
+			// If there's no dot, try to show hover for the field on the current model
+			let model_name = some!(model);
+			let lsp_range = span_conv(desc_value.range());
+			return self.index.hover_property_name(value, model_name, Some(lsp_range));
+		};
+
+		let m2o_field = &value[..dot_pos];
+		let propdef_field = &value[dot_pos + 1..];
+
+		// Calculate which part the cursor is on
+		let relative_offset = offset - range.start;
+		let cursor_on_m2o = relative_offset <= dot_pos;
+
+		let model_name = some!(model);
+		let model_key = some!(_G(model_name));
+
+		if cursor_on_m2o {
+			// Cursor is on the Many2one field part - show hover for it
+			let m2o_range = (range.start..range.start + m2o_field.len()).map_unit(ByteOffset);
+			let lsp_range = rope_conv(m2o_range, rope);
+			return self.index.hover_property_name(m2o_field, model_name, Some(lsp_range));
+		}
+
+		// Cursor is on the PropertiesDefinition field part
+		// First, get the comodel from the Many2one field
+		let comodel = {
+			let entry = some!(self.index.models.populate_properties(model_key.into(), &[]));
+			let fields = some!(entry.fields.as_ref());
+			let m2o_field_key = some!(_G(m2o_field));
+			let m2o_field_entry = some!(fields.get(&m2o_field_key));
+
+			match &m2o_field_entry.kind {
+				FieldKind::Relational(comodel) => *comodel,
+				FieldKind::Value | FieldKind::Related(_) => {
+					return Ok(None);
+				}
+			}
+		};
+		// Lock is now released
+
+		// Show hover for the PropertiesDefinition field on the comodel
+		let comodel_name = _R(comodel);
+		let propdef_range = (range.start + dot_pos + 1..range.end).map_unit(ByteOffset);
+		let lsp_range = rope_conv(propdef_range, rope);
+		self.index.hover_property_name(propdef_field, comodel_name, Some(lsp_range))
+	}
+
 	/// Resolves the attribute and the object's model at the cursor offset
 	/// using [`model_of_range`][Index::model_of_range].
 	///
@@ -865,7 +1062,7 @@ impl Backend {
 	) -> anyhow::Result<Option<Vec<Location>>> {
 		let ByteOffset(offset) = rope_conv(params.text_document_position.position, rope);
 		let uri = &params.text_document_position.text_document.uri;
-		let file_path = uri.to_file_path().unwrap();
+		let file_path = uri_to_path(uri)?;
 		let file_path_str = file_path.to_str().unwrap();
 		let ast = self
 			.ast_map
@@ -922,30 +1119,26 @@ impl Backend {
 						}
 					}
 					Some(PyCompletions::FieldDescriptor) => {
-						use FieldDescriptors as FD;
 						let Some(desc_value) = python_next_named_sibling(capture.node) else {
 							continue;
 						};
+						let descriptor = &contents[range];
+						// TODO: related, when field inheritance is implemented
 						if !desc_value.byte_range().contains_end(offset) {
 							continue;
 						};
 
-						match FD::from_str(&contents[range]) {
-							Ok(FD::ComodelName) => {
-								let range = desc_value.byte_range().shrink(1);
-								let slice = ok!(rope.try_slice(range.clone()));
-								let slice = Cow::from(slice);
-								let slice = some!(_G(slice));
-								return self.model_references(&path, &slice.into());
-							}
-							Ok(FD::Compute | FD::Search | FD::Inverse) => {
-								let range = desc_value.byte_range().shrink(1);
-								let model = some!(this_model.inner.as_ref());
-								let prop = &contents[range];
-								return self.index.method_references(prop, model);
-							}
-							Ok(FD::InverseName) => return Ok(None),
-							Ok(FD::Domain | FD::Related | FD::Groups) | Err(_) => {}
+						if matches!(descriptor, "comodel_name") {
+							let range = desc_value.byte_range().shrink(1);
+							let slice = ok!(rope.try_slice(range.clone()));
+							let slice = Cow::from(slice);
+							let slice = some!(_G(slice));
+							return self.model_references(&path, &slice.into());
+						} else if matches!(descriptor, "compute" | "search" | "inverse") {
+							let range = desc_value.byte_range().shrink(1);
+							let model = some!(this_model.inner.as_ref());
+							let prop = &contents[range];
+							return self.index.method_references(prop, model);
 						}
 
 						return Ok(None);
@@ -970,9 +1163,277 @@ impl Backend {
 		self.index.method_references(prop, model)
 	}
 
+	/// Prepares a rename operation by identifying the symbol at the cursor position.
+	/// Returns the symbol and its range if it can be renamed, None otherwise.
+	pub fn python_prepare_rename(
+		&self,
+		params: TextDocumentPositionParams,
+		rope: RopeSlice<'_>,
+	) -> anyhow::Result<Option<(crate::backend::RenameableSymbol, Range)>> {
+		use crate::backend::RenameableSymbol;
+
+		let ByteOffset(offset) = rope_conv(params.position, rope);
+		let uri = &params.text_document.uri;
+		let file_path = uri_to_path(uri)?;
+		let file_path_str = file_path.to_str().unwrap();
+		let ast = self
+			.ast_map
+			.get(file_path_str)
+			.ok_or_else(|| errloc!("Did not build AST for {}", file_path_str))?;
+		// We need to check for a valid top-level statement but don't use the result
+		let _ = some!(top_level_stmt(ast.root_node(), offset));
+		let query = PyCompletions::query();
+		let contents = Cow::from(rope);
+		let mut cursor = tree_sitter::QueryCursor::new();
+		let current_module = self.index.find_module_of(&file_path);
+
+		let mut matches = cursor.matches(query, ast.root_node(), contents.as_bytes());
+		while let Some(match_) = matches.next() {
+			for capture in match_.captures {
+				let range = capture.node.byte_range();
+				match PyCompletions::from(capture.index) {
+					Some(PyCompletions::XmlId) if range.contains(&offset) => {
+						let inner_range = range.shrink(1);
+						let slice = Cow::from(ok!(rope.try_slice(inner_range.clone())));
+						let mut slice = slice.as_ref();
+						let mut actual_range = inner_range.clone();
+
+						// Handle CSV groups (e.g., groups="base.group_user,base.group_admin")
+						if match_
+							.nodes_for_capture_index(PyCompletions::HasGroups as _)
+							.next()
+							.is_some()
+						{
+							let mut ref_ = None;
+							determine_csv_xmlid_subgroup(&mut ref_, (slice, inner_range), offset);
+							if let Some((s, r)) = ref_ {
+								slice = s;
+								actual_range = r;
+							} else {
+								continue;
+							}
+						}
+
+						// Convert to qualified ID
+						let qualified_id = if slice.contains('.') {
+							slice.to_string()
+						} else if let Some(module) = current_module {
+							format!("{}.{}", _R(module), slice)
+						} else {
+							slice.to_string()
+						};
+
+						let lsp_range = rope_conv(actual_range.map_unit(ByteOffset), rope);
+						return Ok(Some((
+							RenameableSymbol::XmlId {
+								qualified_id,
+								current_module,
+							},
+							lsp_range,
+						)));
+					}
+					Some(PyCompletions::Model) => {
+						let is_meta = match_
+							.nodes_for_capture_index(PyCompletions::Prop as _)
+							.next()
+							.map(|prop| matches!(&contents[prop.byte_range()], "_name" | "_inherit"))
+							.unwrap_or(true);
+						if is_meta && range.contains(&offset) {
+							let inner_range = range.shrink(1);
+							let slice = ok!(rope.try_slice(inner_range.clone()));
+							let slice = Cow::from(slice);
+							let model = some!(_G(&slice));
+							let lsp_range = rope_conv(inner_range.map_unit(ByteOffset), rope);
+							return Ok(Some((RenameableSymbol::ModelName(model.into()), lsp_range)));
+						}
+					}
+					Some(PyCompletions::FieldDescriptor) => {
+						let Some(desc_value) = python_next_named_sibling(capture.node) else {
+							continue;
+						};
+						let descriptor = &contents[range];
+						if !desc_value.byte_range().contains_end(offset) {
+							continue;
+						};
+
+						if matches!(descriptor, "comodel_name") {
+							let inner_range = desc_value.byte_range().shrink(1);
+							let slice = ok!(rope.try_slice(inner_range.clone()));
+							let slice = Cow::from(slice);
+							let model = some!(_G(&slice));
+							let lsp_range = rope_conv(inner_range.map_unit(ByteOffset), rope);
+							return Ok(Some((RenameableSymbol::ModelName(model.into()), lsp_range)));
+						}
+						// compute, search, inverse - method names - not yet supported
+						return Ok(None);
+					}
+					_ => {}
+				}
+			}
+		}
+
+		// No renameable symbol found at cursor
+		Ok(None)
+	}
+
+	/// Prepares call hierarchy by identifying a method or function at the cursor position.
+	/// Returns a list of CallHierarchyItems (usually just one) if the cursor is on a callable.
+	pub fn python_prepare_call_hierarchy(
+		&self,
+		params: CallHierarchyPrepareParams,
+		rope: RopeSlice<'_>,
+	) -> anyhow::Result<Option<Vec<CallHierarchyItem>>> {
+		use crate::backend::CallHierarchyData;
+		use crate::call_graph::CallableId;
+
+		let ByteOffset(offset) = rope_conv(params.text_document_position_params.position, rope);
+		let uri = &params.text_document_position_params.text_document.uri;
+		let file_path = uri_to_path(uri)?;
+		let file_path_str = file_path.to_str().unwrap();
+		let ast = self
+			.ast_map
+			.get(file_path_str)
+			.ok_or_else(|| errloc!("Did not build AST for {}", file_path_str))?;
+
+		let contents = Cow::from(rope);
+		let query = PyCompletions::query();
+		let mut cursor = tree_sitter::QueryCursor::new();
+		let mut this_model = ThisModel::default();
+
+		// First pass: find model context
+		let mut matches = cursor.matches(query, ast.root_node(), contents.as_bytes());
+		while let Some(match_) = matches.next() {
+			for capture in match_.captures {
+				let range = capture.node.byte_range();
+				if let Some(PyCompletions::Model) = PyCompletions::from(capture.index) {
+					if range.end < offset {
+						this_model.tag_model(
+							capture.node,
+							match_,
+							ast.root_node().byte_range(),
+							&contents,
+						);
+					}
+				}
+			}
+		}
+
+		// Check if cursor is on a method definition
+		// Look for function_definition nodes
+		let root = ast.root_node();
+		let mut node_at_cursor = root.descendant_for_byte_range(offset, offset);
+
+		while let Some(node) = node_at_cursor {
+			match node.kind() {
+				"function_definition" => {
+					// Found a function definition - check if it's a method
+					let name_node = node.child_by_field_name("name");
+					if let Some(name_node) = name_node {
+						let name_range = name_node.byte_range();
+						// Check if cursor is on or near the function name
+						if name_range.contains(&offset) || node.byte_range().start <= offset && offset <= name_range.end + 10 {
+							let method_name = &contents[name_range.clone()];
+							let lsp_range = span_conv(name_node.range());
+
+							// Check if this is inside a class (making it a method)
+							if let Some(model) = this_model.inner {
+								let callable = CallableId::method(model, method_name);
+								let item = CallHierarchyItem {
+									name: method_name.to_string(),
+									kind: SymbolKind::METHOD,
+									tags: None,
+									detail: Some(model.to_string()),
+									uri: uri.clone(),
+									range: span_conv(node.range()),
+									selection_range: lsp_range,
+									data: serde_json::to_value(CallHierarchyData { callable }).ok(),
+								};
+								return Ok(Some(vec![item]));
+							} else {
+								// Module-level function
+								let callable = CallableId::function(file_path_str, method_name);
+								let item = CallHierarchyItem {
+									name: method_name.to_string(),
+									kind: SymbolKind::FUNCTION,
+									tags: None,
+									detail: Some(file_path_str.to_string()),
+									uri: uri.clone(),
+									range: span_conv(node.range()),
+									selection_range: lsp_range,
+									data: serde_json::to_value(CallHierarchyData { callable }).ok(),
+								};
+								return Ok(Some(vec![item]));
+							}
+						}
+					}
+				}
+				"call" => {
+					// Cursor is on a call expression - try to resolve the callee
+					let func_node = node.child_by_field_name("function").or_else(|| node.named_child(0));
+					if let Some(func_node) = func_node {
+						if func_node.kind() == "attribute" {
+							// Method call: obj.method()
+							let method_node = func_node.child_by_field_name("attribute");
+							if let Some(method_node) = method_node {
+								let method_range = method_node.byte_range();
+								if method_range.contains(&offset) {
+									let method_name = &contents[method_range.clone()];
+
+									// Try to resolve the object's type to get the model
+									let obj_node = func_node.child_by_field_name("object");
+									if let Some(_obj_node) = obj_node {
+									// Use the current model context as fallback
+									if let Some(model) = this_model.inner {
+										let callable = CallableId::method(model, method_name);
+										let item = CallHierarchyItem {
+											name: method_name.to_string(),
+											kind: SymbolKind::METHOD,
+											tags: None,
+											detail: Some(model.to_string()),
+											uri: uri.clone(),
+											range: span_conv(node.range()),
+											selection_range: span_conv(method_node.range()),
+											data: serde_json::to_value(CallHierarchyData { callable }).ok(),
+										};
+										return Ok(Some(vec![item]));
+									}
+									}
+								}
+							}
+						} else if func_node.kind() == "identifier" {
+							// Direct function call: func()
+							let func_range = func_node.byte_range();
+							if func_range.contains(&offset) {
+								let func_name = &contents[func_range.clone()];
+
+								// Check if it's a known function in current file or imports
+								let callable = CallableId::function(file_path_str, func_name);
+								let item = CallHierarchyItem {
+									name: func_name.to_string(),
+									kind: SymbolKind::FUNCTION,
+									tags: None,
+									detail: Some(file_path_str.to_string()),
+									uri: uri.clone(),
+									range: span_conv(node.range()),
+									selection_range: span_conv(func_node.range()),
+									data: serde_json::to_value(CallHierarchyData { callable }).ok(),
+								};
+								return Ok(Some(vec![item]));
+							}
+						}
+					}
+				}
+				_ => {}
+			}
+			node_at_cursor = node.parent();
+		}
+
+		Ok(None)
+	}
+
 	pub fn python_hover(&self, params: HoverParams, rope: RopeSlice<'_>) -> anyhow::Result<Option<Hover>> {
 		let uri = &params.text_document_position_params.text_document.uri;
-		let file_path = uri.to_file_path().unwrap();
+		let file_path = uri_to_path(uri)?;
 		let file_path_str = file_path.to_str().unwrap();
 		let ast = self
 			.ast_map
@@ -1074,67 +1535,70 @@ impl Backend {
 						return self.index.hover_property_name(name, model, Some(range));
 					}
 					Some(PyCompletions::FieldDescriptor) => {
-						use FieldDescriptors as FD;
 						let Some(desc_value) = python_next_named_sibling(capture.node) else {
 							continue;
 						};
+						let descriptor = &contents[range];
 						if !desc_value.byte_range().contains_end(offset) {
 							continue;
 						}
 
-						match FD::from_str(&contents[range]) {
-							Ok(FD::ComodelName) => {
-								let range = desc_value.byte_range().shrink(1);
-								let lsp_range = span_conv(desc_value.range());
-								let slice = ok!(rope.try_slice(range.clone()));
-								let slice = Cow::from(slice);
-								return self.index.hover_model(&slice, Some(lsp_range), false, None);
+						if matches!(descriptor, "comodel_name") {
+							let range = desc_value.byte_range().shrink(1);
+							let lsp_range = span_conv(desc_value.range());
+							let slice = ok!(rope.try_slice(range.clone()));
+							let slice = Cow::from(slice);
+							return self.index.hover_model(&slice, Some(lsp_range), false, None);
+						} else if matches!(descriptor, "compute" | "search" | "inverse" | "related" | "inverse_name") {
+							let single_field = matches!(descriptor, "related" | "inverse_name");
+							let mapped_model = if descriptor == "inverse_name" {
+								extract_comodel_name(match_.captures, &contents)
+									.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
+							} else {
+								this_model.inner
+							};
+							let mapped = some!(self.gather_mapped(
+								root,
+								match_,
+								Some(offset),
+								desc_value.byte_range(),
+								mapped_model,
+								&contents,
+								false,
+								Some(single_field)
+							));
+							let mut needle = mapped.needle;
+							let mut model = _I(mapped.model);
+							let mut range = mapped.range;
+							if !mapped.single_field {
+								some!(
+									self.index
+										.models
+										.resolve_mapped(&mut model, &mut needle, Some(&mut range))
+										.ok()
+								);
 							}
-							Ok(
-								descriptor @ (FD::Compute | FD::Search | FD::Inverse | FD::Related | FD::InverseName),
-							) => {
-								let single_field = matches!(descriptor, FD::Related | FD::InverseName);
-								let mapped_model = if matches!(descriptor, FD::InverseName) {
-									extract_comodel_name(match_.captures, &contents)
-										.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
-								} else {
-									this_model.inner
-								};
-								let mapped = some!(self.gather_mapped(
-									root,
-									match_,
-									Some(offset),
-									desc_value.byte_range(),
-									mapped_model,
-									&contents,
-									false,
-									Some(single_field)
-								));
-								let mut needle = mapped.needle;
-								let mut model = _I(mapped.model);
-								let mut range = mapped.range;
-								if !mapped.single_field {
-									some!(
-										self.index
-											.models
-											.resolve_mapped(&mut model, &mut needle, Some(&mut range))
-											.ok()
-									);
-								}
-								let model = _R(model);
-								return (self.index).hover_property_name(needle, model, Some(rope_conv(range, rope)));
-							}
-							Ok(FD::Groups) => {
-								let range = desc_value.byte_range().shrink(1);
-								let value = Cow::from(ok!(rope.try_slice(range.clone())));
-								let mut ref_ = None;
-								determine_csv_xmlid_subgroup(&mut ref_, (&value, range), offset);
-								let (needle, byte_range) = some!(ref_);
-								return self
-									.index
-									.hover_record(needle, Some(rope_conv(byte_range.map_unit(ByteOffset), rope)));
-							}
-							Ok(FD::Domain) | Err(_) => {}
+							let model = _R(model);
+							return (self.index).hover_property_name(needle, model, Some(rope_conv(range, rope)));
+						} else if matches!(descriptor, "groups") {
+							let range = desc_value.byte_range().shrink(1);
+							let value = Cow::from(ok!(rope.try_slice(range.clone())));
+							let mut ref_ = None;
+							determine_csv_xmlid_subgroup(&mut ref_, (&value, range), offset);
+							let (needle, byte_range) = some!(ref_);
+							return self
+								.index
+								.hover_record(needle, Some(rope_conv(byte_range.map_unit(ByteOffset), rope)));
+						} else if matches!(descriptor, "definition") {
+							// Hover for Properties definition path
+							// Format: "many2one_field.properties_definition_field"
+							return self.hover_properties_definition(
+								desc_value,
+								offset,
+								this_model.inner,
+								&contents,
+								rope,
+							);
 						}
 
 						return Ok(None);
@@ -1153,6 +1617,18 @@ impl Backend {
 				}
 			}
 		}
+		// First check if the cursor is on an attribute of Type::Env
+		if let Some((lhs, attr, range)) = Self::attribute_node_at_offset(offset, root, &contents) {
+			if let Some((tid, _scope)) =
+				self.index.type_of_range(root, lhs.byte_range().map_unit(ByteOffset), &contents)
+			{
+				if matches!(type_cache().resolve(tid), Type::Env) {
+					let lsp_range = Some(rope_conv(range.map_unit(ByteOffset), rope));
+					return self.index.hover_env_attribute(attr, lsp_range);
+				}
+			}
+		}
+
 		if let Some((model, prop, range)) = self.attribute_at_offset(offset, root, &contents) {
 			let lsp_range = Some(rope_conv(range.map_unit(ByteOffset), rope));
 			return self.index.hover_property_name(prop, model, lsp_range);
@@ -1170,6 +1646,11 @@ impl Backend {
 			return self.index.hover_model(model, Some(lsp_range), true, identifier);
 		}
 
+		// Check if we're hovering over a domain operator string
+		if let Some(hover) = self.hover_domain_operator(needle, &contents, rope) {
+			return Ok(Some(hover));
+		}
+
 		self.index.hover_variable(
 			(needle.kind() == "identifier").then(|| &contents[needle.byte_range()]),
 			type_,
@@ -1177,12 +1658,52 @@ impl Backend {
 		)
 	}
 
+	/// Check if the given node is a domain operator and return hover info.
+	fn hover_domain_operator(&self, node: Node, contents: &str, rope: RopeSlice<'_>) -> Option<Hover> {
+		// Only check string nodes
+		if node.kind() != "string" {
+			return None;
+		}
+
+		let range = node.byte_range();
+		if range.len() < 2 {
+			return None;
+		}
+
+		let inner_range = range.clone().shrink(1);
+		let operator = &contents[inner_range];
+
+		// Check for domain-level operators (&, |, !)
+		if let Some(doc) = crate::domain::get_domain_operator_hover(operator) {
+			return Some(Hover {
+				contents: HoverContents::Markup(MarkupContent {
+					kind: MarkupKind::Markdown,
+					value: doc,
+				}),
+				range: Some(rope_conv(range.map_unit(ByteOffset), rope)),
+			});
+		}
+
+		// Check for term-level operators (=, !=, like, in, any, etc.)
+		if let Some(doc) = crate::domain::get_operator_hover(operator) {
+			return Some(Hover {
+				contents: HoverContents::Markup(MarkupContent {
+					kind: MarkupKind::Markdown,
+					value: doc,
+				}),
+				range: Some(rope_conv(range.map_unit(ByteOffset), rope)),
+			});
+		}
+
+		None
+	}
+
 	pub(crate) fn python_signature_help(&self, params: SignatureHelpParams) -> anyhow::Result<Option<SignatureHelp>> {
 		use std::fmt::Write;
 
 		let uri = &params.text_document_position_params.text_document.uri;
 		let document = some!((self.document_map).get(uri.path().as_str()));
-		let file_path = uri.to_file_path().unwrap();
+		let file_path = uri_to_path(uri)?;
 		let ast = some!((self.ast_map).get(file_path.to_str().unwrap()));
 		let contents = Cow::from(&document.rope);
 
@@ -1286,20 +1807,24 @@ impl Backend {
 		params: CodeActionParams,
 		rope: RopeSlice<'_>,
 	) -> anyhow::Result<Option<CodeActionResponse>> {
+		use std::collections::HashMap;
+
 		let uri = &params.text_document.uri;
-		let file_path = uri.to_file_path().unwrap();
-		let file_path_str = file_path.to_str().unwrap();
-		let ast = self
-			.ast_map
-			.get(file_path_str)
-			.ok_or_else(|| errloc!("Did not build AST for {}", file_path_str))?;
+		let Some(file_path) = uri.to_file_path() else {
+			return Ok(None);
+		};
+		let path_str = file_path.to_str().ok_or_else(|| anyhow::anyhow!("Invalid path"))?;
+		let Some(ast) = self.ast_map.get(path_str) else {
+			return Ok(None);
+		};
 		let ByteOffset(offset) = rope_conv(params.range.end, rope);
 		let contents = Cow::from(rope);
 
+		let mut actions: Vec<CodeActionOrCommand> = Vec::new();
+
+		// 1. Model code actions (e.g., jump to model definition)
 		let query = PyCompletions::query();
 		let mut cursor = tree_sitter::QueryCursor::new();
-		// let mut this_model = ThisModel::default();
-
 		let mut matches = cursor.matches(query, ast.root_node(), contents.as_bytes());
 		while let Some(match_) = matches.next() {
 			for capture in match_.captures {
@@ -1309,14 +1834,138 @@ impl Backend {
 						let range = range.shrink(1);
 						let slice = ok!(rope.try_slice(range.clone()));
 						let slice = Cow::from(slice);
-						return self.index.code_action_for_model(&slice, &file_path);
+						if let Some(model_actions) = self.index.code_action_for_model(&slice, &file_path)? {
+							actions.extend(model_actions);
+						}
 					}
 					_ => {}
 				}
 			}
 		}
 
-		Ok(None)
+		// 2. Missing super() call quick-fix
+		let diagnostics = &params.context.diagnostics;
+		let missing_super_diags: Vec<_> = diagnostics
+			.iter()
+			.filter(|d| {
+				d.message.contains("does not call `super()")
+					&& d.range.start.line >= params.range.start.line
+					&& d.range.end.line <= params.range.end.line
+			})
+			.collect();
+
+		for diag in missing_super_diags {
+			// Extract method name from diagnostic message
+			let method_name = diag
+				.message
+				.strip_prefix("Method `")
+				.and_then(|s| s.split('`').next());
+
+			let Some(method_name) = method_name else {
+				continue;
+			};
+
+			// Find the method node at this location
+			let start_offset: ByteOffset = rope_conv(diag.range.start, rope);
+			let Some(node) = ast.root_node().descendant_for_byte_range(start_offset.0, start_offset.0) else {
+				continue;
+			};
+
+			// Walk up to find function_definition
+			let mut fn_node = node;
+			while fn_node.kind() != "function_definition" {
+				let Some(parent) = fn_node.parent() else {
+					break;
+				};
+				fn_node = parent;
+			}
+
+			if fn_node.kind() != "function_definition" {
+				continue;
+			}
+
+			// Find the block (body) of the function
+			let Some(block) = fn_node.child_by_field_name("body") else {
+				continue;
+			};
+
+			// Find the first statement in the block
+			let Some(first_stmt) = block.named_child(0) else {
+				continue;
+			};
+
+			// Check if it's a docstring - if so, insert after it
+			let insert_after_docstring = first_stmt.kind() == "expression_statement"
+				&& first_stmt.named_child(0).is_some_and(|n| n.kind() == "string");
+
+			let insert_node = if insert_after_docstring {
+				block.named_child(1).unwrap_or(first_stmt)
+			} else {
+				first_stmt
+			};
+
+			// Get the indentation of the first statement
+			let insert_range: Range = span_conv(insert_node.range());
+			let stmt_start: ByteOffset = rope_conv(
+				Position {
+					line: insert_range.start.line,
+					character: 0,
+				},
+				rope,
+			);
+			let stmt_line = &contents[stmt_start.0..insert_node.start_byte()];
+			let indent = stmt_line.chars().take_while(|c| c.is_whitespace()).collect::<String>();
+
+			// Build the super() call text
+			let super_call = format!("{}super().{}()\n", indent, method_name);
+
+			// Calculate insert position (at the start of the insert_node line)
+			let insert_pos = if insert_after_docstring {
+				// Insert on a new line after the docstring
+				let docstring_end: Range = span_conv(first_stmt.range());
+				Position {
+					line: docstring_end.end.line + 1,
+					character: 0,
+				}
+			} else {
+				Position {
+					line: insert_range.start.line,
+					character: 0,
+				}
+			};
+
+			// Create the text edit
+			let edit = TextEdit {
+				range: Range {
+					start: insert_pos,
+					end: insert_pos,
+				},
+				new_text: super_call,
+			};
+
+			// Create workspace edit
+			let mut changes = HashMap::new();
+			changes.insert(uri.clone(), vec![edit]);
+
+			let workspace_edit = WorkspaceEdit {
+				changes: Some(changes),
+				..Default::default()
+			};
+
+			actions.push(CodeActionOrCommand::CodeAction(CodeAction {
+				title: format!("Add missing super().{}() call", method_name),
+				kind: Some(CodeActionKind::QUICKFIX),
+				diagnostics: Some(vec![diag.clone()]),
+				edit: Some(workspace_edit),
+				..Default::default()
+			}));
+		}
+
+		if actions.is_empty() {
+			Ok(None)
+		} else {
+			Ok(Some(actions))
+		}
 	}
 
 	fn is_commandlist(cmdlist: Node, offset: usize) -> bool {
@@ -1550,6 +2199,7 @@ impl Backend {
 
 		Some((needle, range, model))
 	}
+
 }
 
 #[derive(Default, Clone)]
@@ -1627,24 +2277,11 @@ fn extract_string_needle_at_offset<'a>(
 
 fn extract_comodel_name<'tree>(captures: &[QueryCapture<'tree>], contents: &str) -> Option<Node<'tree>> {
 	for cap in captures {
-		match PyCompletions::from(cap.index) {
-			Some(PyCompletions::Model) => {
-				if let Some(parent) = cap.node.parent()
-					&& parent.kind() == "argument_list"
-				{
-					return Some(cap.node);
-				}
-			}
-			Some(PyCompletions::FieldDescriptor) => {
-				let Ok(FieldDescriptors::ComodelName) = FieldDescriptors::from_str(&contents[cap.node.byte_range()])
-				else {
-					continue;
-				};
-				return cap.node.next_named_sibling();
-			}
-			_ => {}
+		if matches!(PyCompletions::from(cap.index), Some(PyCompletions::FieldDescriptor))
+			&& &contents[cap.node.byte_range()] == "comodel_name"
+		{
+			return python_next_named_sibling(cap.node);
 		}
 	}
-
 	None
 }

@@ -8,8 +8,7 @@ use tree_sitter::QueryCursor;
 /// as a `(string)` since that would reify its shape and refuse subsequent matches.
 #[test]
 fn test_model_fields() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = br#"
 class Foo(models.Model):
 	foo = fields.Char('asd', help='asd')
@@ -35,7 +34,7 @@ class Foo(models.Model):
 		&["bar", "fields", "Many2one", "comodel_name", "'asd'", "help", "'asd'"],
 		&["def foobs(self):\n\t\t...", "foobs"],
 		&["haha", "fields", "Many2many", "'asd'"],
-		&["what", "fields", "What"],
+		&["what", "fields", "What", "asd"],
 		&["def passer(self):\n\t\t...", "passer"],
 		&[
 			"html", "fields", "Html", "related", "'asd'", "foo", "123", "help", "'asdf'",
@@ -56,8 +55,7 @@ class Foo(models.Model):
 
 #[test]
 fn test_py_completions() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = br#"
 self.env.ref('ref')
 env['model']
@@ -94,8 +92,7 @@ foo = fields.Char()
 
 #[test]
 fn test_py_completions_class_scoped() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = br#"
 class Foo(models.AbstractModel):
 	_name = 'foo'
@@ -166,8 +163,7 @@ class Foo(models.AbstractModel):
 
 #[test]
 fn test_attribute_node_at_offset() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = "foo.mapped(lambda f: f.bar)";
 	let offset = contents.find("bar").unwrap();
 	let ast = parser.parse(contents, None).unwrap();
@@ -179,8 +175,7 @@ fn test_attribute_node_at_offset() {
 
 #[test]
 fn test_attribute_at_offset_2() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = "super().powerful()";
 	let offset = contents.find("powerful").unwrap();
 	let ast = parser.parse(contents, None).unwrap();
@@ -192,8 +187,7 @@ fn test_attribute_at_offset_2() {
 
 #[test]
 fn test_top_level_stmt() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = "class A:\n    pass\n\nclass B:\n    pass\n";
 	let offset = contents.find("class B").unwrap() + 6;
 	let contents = contents.as_bytes();
@@ -205,8 +199,7 @@ fn test_top_level_stmt() {
 
 #[test]
 fn test_tag_model() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let contents = "class A(models.Model):\n    _name = 'foo'\n    _inherit = 'bar'\n\nclass B(models.Model):\n    _inherit = 'baz'\n";
 	let ast = parser.parse(contents, None).unwrap();
 	let query = super::PyCompletions::query();
@@ -247,8 +240,7 @@ fn test_py_completions_broken_syntax_commandlist() {
 	// Find the position after 'desc' where we want completion
 	let cursor_pos = contents.find("'desc'").unwrap() + 5; // After 'desc
 
-	let mut parser = tree_sitter::Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let tree = parser.parse(contents.as_bytes(), None).unwrap();
 
 	// Find the dictionary node
@@ -312,8 +304,7 @@ class TestModel(models.Model):
 "#;
 
 	// Parse the Python code
-	let mut parser = tree_sitter::Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let tree = parser.parse(contents.as_bytes(), None).unwrap();
 
 	// Find position after 'description' (missing colon)
@@ -367,8 +358,7 @@ class TestModel(models.Model):
 		})
 "#;
 
-	let mut parser = tree_sitter::Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let tree = parser.parse(contents.as_bytes(), None).unwrap();
 
 	// Find position in the middle of 'description' key
@@ -415,8 +405,7 @@ class TestModel(models.Model):
 "#;
 
 	// Parse the Python code
-	let mut parser = tree_sitter::Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let tree = parser.parse(contents.as_bytes(), None).unwrap();
 
 	// Test 1: Complete field access should work
@@ -480,39 +469,96 @@ class TestModel(models.Model):
 }
 
 #[test]
-fn test_extract_comodel_name() {
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
-
+fn test_except_clause_structure() {
+	// Test to understand tree-sitter structure for except clauses
+	// Structure is:
+	//   except_clause -> as_pattern -> [exception_type, as_pattern_target -> identifier]
+	//                 -> block
+	// For bare except (no alias):
+	//   except_clause -> identifier (exception type)
+	//                 -> block
 	let contents = r#"
-		class What(models.Model):
-			foo = fields.One2many('foob')
-			bar = fields.One2many(comodel_name='foob')
-	"#;
-	let ast = parser.parse(contents.as_bytes(), None).unwrap();
-	let query = PyCompletions::query();
-	let mut cursor = QueryCursor::new();
-	let mut matches = cursor.matches(query, ast.root_node(), contents.as_bytes());
-	let mut matched = 0;
-	while let Some(match_) = matches.next() {
-		for cap in match_.captures {
-			let Some(PyCompletions::Prop) = PyCompletions::from(cap.index) else {
-				continue;
-			};
-			match &contents[cap.node.byte_range()] {
-				"foo" => {
-					let comodel = extract_comodel_name(match_.captures, contents).unwrap();
-					assert_eq!(&contents[comodel.byte_range()], "'foob'");
-					matched += 1;
-				}
-				"bar" => {
-					let comodel = extract_comodel_name(match_.captures, contents).unwrap();
-					assert_eq!(&contents[comodel.byte_range()], "'foob'");
-					matched += 1;
-				}
-				_ => unreachable!(),
-			}
+try:
+    x = 1
+except ValueError as e:
+    print(e)
+except (TypeError, KeyError) as err:
+    print(err)
+except Exception:
+    pass
+"#;
+
+	let mut parser = python_parser();
+	let tree = parser.parse(contents.as_bytes(), None).unwrap();
+
+	fn find_except_clauses(node: tree_sitter::Node) -> Vec<tree_sitter::Node> {
+		let mut result = vec![];
+		if node.kind() == "except_clause" {
+			result.push(node);
 		}
+		let mut cursor = node.walk();
+		for child in node.children(&mut cursor) {
+			result.extend(find_except_clauses(child));
+		}
+		result
 	}
-	assert_eq!(matched, 2);
+
+	let except_clauses = find_except_clauses(tree.root_node());
+	assert_eq!(except_clauses.len(), 3, "Should find 3 except clauses");
+
+	// First except clause: `except ValueError as e:`
+	// Structure: except_clause -> as_pattern -> [identifier, as_pattern_target -> identifier]
+	let clause1 = except_clauses[0];
+	let mut cursor = clause1.walk();
+	let children: Vec<_> = clause1.named_children(&mut cursor).collect();
+	
+	assert_eq!(children.len(), 2, "First except clause: as_pattern + block");
+	assert_eq!(children[0].kind(), "as_pattern");
+	
+	// Dig into as_pattern
+	let as_pattern = children[0];
+	let mut ap_cursor = as_pattern.walk();
+	let ap_children: Vec<_> = as_pattern.named_children(&mut ap_cursor).collect();
+	
+	assert_eq!(ap_children.len(), 2, "as_pattern should have 2 children: exception_type + alias");
+	assert_eq!(ap_children[0].kind(), "identifier"); // ValueError
+	assert_eq!(&contents[ap_children[0].byte_range()], "ValueError");
+	assert_eq!(ap_children[1].kind(), "as_pattern_target");
+	
+	// Get the alias identifier from as_pattern_target
+	let alias_target = ap_children[1];
+	let alias = alias_target.named_child(0).expect("as_pattern_target should have identifier");
+	assert_eq!(alias.kind(), "identifier");
+	assert_eq!(&contents[alias.byte_range()], "e");
+
+	// Second except clause: `except (TypeError, KeyError) as err:`
+	let clause2 = except_clauses[1];
+	let mut cursor2 = clause2.walk();
+	let children2: Vec<_> = clause2.named_children(&mut cursor2).collect();
+	
+	assert_eq!(children2.len(), 2, "Second except clause: as_pattern + block");
+	assert_eq!(children2[0].kind(), "as_pattern");
+	
+	let as_pattern2 = children2[0];
+	let mut ap2_cursor = as_pattern2.walk();
+	let ap2_children: Vec<_> = as_pattern2.named_children(&mut ap2_cursor).collect();
+	
+	// For tuple exception types: tuple + as_pattern_target
+	assert_eq!(ap2_children.len(), 2);
+	assert_eq!(ap2_children[0].kind(), "tuple");
+	assert_eq!(ap2_children[1].kind(), "as_pattern_target");
+	
+	let alias2 = ap2_children[1].named_child(0).unwrap();
+	assert_eq!(&contents[alias2.byte_range()], "err");
+
+	// Third except clause: `except Exception:` (no alias)
+	let clause3 = except_clauses[2];
+	let mut cursor3 = clause3.walk();
+	let children3: Vec<_> = clause3.named_children(&mut cursor3).collect();
+	
+	// No as_pattern, just identifier + block
+	assert_eq!(children3.len(), 2, "Third except clause: identifier + block");
+	assert_eq!(children3[0].kind(), "identifier");
+	assert_eq!(&contents[children3[0].byte_range()], "Exception");
+	assert_eq!(children3[1].kind(), "block");
 }

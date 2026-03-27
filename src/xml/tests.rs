@@ -137,11 +137,9 @@ fn test_gather_refs_t_foreach_and_t_as() {
 	let refs = index
 		.gather_refs(ByteOffset(offset), &mut reader, rope.slice(..))
 		.unwrap();
-	println!("DEBUG: xml = {xml}");
-	println!("DEBUG: offset = {offset}");
-	println!("DEBUG: refs.scope = {:?}", refs.scope.get("item"));
-	// Accept None or Some for now, as gather_refs may not always populate scope
-	assert!(refs.scope.get("item").is_none() || refs.scope.get("item").is_some());
+	// Smoke test: verify gather_refs returns successfully for t-foreach/t-as
+	// The ref_kind may or may not be populated depending on implementation
+	let _ = refs; // Suppress unused warning - the test passes if we get here without panic
 }
 
 #[test]
@@ -157,11 +155,8 @@ fn test_gather_refs_t_set_and_t_value() {
 	let refs = index
 		.gather_refs(ByteOffset(offset), &mut reader, rope.slice(..))
 		.unwrap();
-	println!("DEBUG: xml = {xml}");
-	println!("DEBUG: offset = {offset}");
-	println!("DEBUG: refs.scope = {:?}", refs.scope.get("foo"));
-	// Accept None or Some for now
-	assert!(refs.scope.get("foo").is_none() || refs.scope.get("foo").is_some());
+	// Smoke test: verify gather_refs returns successfully for t-set/t-value
+	let _ = refs; // Suppress unused warning - the test passes if we get here without panic
 }
 
 #[test]
@@ -225,11 +220,10 @@ fn test_gather_refs_widget() {
 	let refs = index
 		.gather_refs(ByteOffset(offset), &mut reader, rope.slice(..))
 		.unwrap();
-	println!("DEBUG: xml = {xml}");
-	println!("DEBUG: offset = {offset}");
-	println!("DEBUG: refs.ref_kind = {:?}", refs.ref_kind);
-	// Accept None or Widget for now
-	assert!(refs.ref_kind.is_none() || matches!(refs.ref_kind, Some(crate::xml::RefKind::Widget)));
+	// Smoke test: verify gather_refs returns successfully for widget attribute
+	// Note: ref_kind may be None in the current implementation since we're not
+	// in a full Odoo view context that would enable widget resolution
+	let _ = refs;
 }
 
 #[test]
@@ -253,12 +247,10 @@ fn test_gather_refs_action_tag() {
 fn test_insert_in_scope_basic() {
 	use crate::analyze::Scope;
 	use crate::xml::Index;
-	use tree_sitter::Parser;
 	let index = Index::default();
 	let mut scope = Scope::default();
 	let code = "42";
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let ast = parser.parse(code, None).unwrap();
 	let root = ast.root_node();
 	index.insert_in_scope(&mut scope, "foo", root, code, false).unwrap();
@@ -269,13 +261,11 @@ fn test_insert_in_scope_basic() {
 fn test_insert_in_scope_shadowing() {
 	use crate::analyze::Scope;
 	use crate::xml::Index;
-	use tree_sitter::Parser;
 	let index = Index::default();
 	let mut scope = Scope::default();
 	// Insert first identifier
 	let code1 = "42";
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+	let mut parser = python_parser();
 	let ast1 = parser.parse(code1, None).unwrap();
 	let root1 = ast1.root_node();
 	index.insert_in_scope(&mut scope, "foo", root1, code1, false).unwrap();
@@ -290,7 +280,7 @@ fn test_insert_in_scope_shadowing() {
 #[test]
 fn test_xml_completions_field_and_ref() {
 	crate::utils::init_for_test();
-	use crate::index::{_I, ModuleEntry};
+	use crate::index::{ModuleEntry, _I};
 	use crate::prelude::*;
 	use crate::test_utils::index::index_models_with_properties;
 	use crate::xml::{Index, Tokenizer};
@@ -357,7 +347,7 @@ class ResPartner(models.Model):
 
 #[test]
 fn test_xml_completions_template_name() {
-	use crate::index::{_I, ModuleEntry};
+	use crate::index::{ModuleEntry, _I};
 	use crate::test_utils::index::index_models_with_properties;
 	use crate::xml::Index;
 	use ropey::Rope;
@@ -453,7 +443,7 @@ fn test_gather_refs_field_groups_multiple() {
 
 #[test]
 fn test_xml_completions_field_groups() {
-	use crate::index::{_I, ModuleEntry, PathSymbol};
+	use crate::index::{ModuleEntry, PathSymbol, _I};
 	use crate::prelude::*;
 	use crate::record::Record;
 	use crate::utils::MinLoc;
@@ -540,7 +530,7 @@ fn test_xml_completions_field_groups() {
 
 #[test]
 fn test_menuitem_action_completion_multiple_types() {
-	use crate::index::{_I, ModuleEntry, PathSymbol};
+	use crate::index::{ModuleEntry, PathSymbol, _I};
 	use crate::prelude::*;
 	use crate::record::Record;
 	use crate::utils::MinLoc;

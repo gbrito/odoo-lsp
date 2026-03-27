@@ -1,0 +1,23 @@
+<odoo>
+    <!-- ^symbol sale_partner -->
+    <!-- ^symbol sale_form_inherit -->
+
+    <record id="sale_partner" model="res.partner">
+        <field name="name">Sale Partner</field>
+        <field name="company_id" ref="base.main_company"/>
+        <!--                                           ^hint res.company -->
+    </record>
+
+    <record id="sale_form_inherit" model="ir.ui.view">
+        <field name="name">Sale Partner Form Inherit</field>
+        <field name="model">res.partner</field>
+        <field name="inherit_id" ref="base.partner_form"/>
+        <!--                                          ^hint ir.ui.view -->
+        <field name="arch" type="xml">
+            <xpath expr="//field[@name='email']" position="after">
+                <field name="company_id"/>
+                <!--                   ^hint Many2one[res.company] -->
+            </xpath>
+        </field>
+    </record>
+</odoo>

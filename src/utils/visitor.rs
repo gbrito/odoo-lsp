@@ -50,13 +50,12 @@ impl<'a> Iterator for PreTravel<'a> {
 #[cfg(test)]
 mod tests {
 	use super::*;
+	use crate::utils::python_parser;
 	use pretty_assertions::assert_eq;
-	use tree_sitter::Parser;
 
 	#[test]
 	fn test_simple_call() {
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let contents = b"foo.mapped(lambda f: f.bar)";
 		let asts = PreTravel::new(parser.parse(contents, None).unwrap().root_node())
 			.flat_map(|node| {

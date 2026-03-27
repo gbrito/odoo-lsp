@@ -24,12 +24,12 @@ use crate::analyze::{Scope, Type, TypeId, type_cache};
 use crate::prelude::*;
 
 use crate::component::{Prop, PropDescriptor};
-use crate::config::{CompletionsConfig, Config, ModuleConfig, ReferencesConfig};
+use crate::config::{CompletionsConfig, Config, DiagnosticsConfig, ModuleConfig, ReferencesConfig};
 use crate::index::{Component, Index, ModuleName, RecordId, Symbol, SymbolSet};
 use crate::model::{Field, FieldKind, Method, ModelEntry, ModelLocation, ModelName, PropertyKind};
 use crate::python::top_level_stmt;
 use crate::record::Record;
-use crate::utils::{MaxVec, Semaphore, strict_canonicalize, to_display_path};
+use crate::utils::{MaxVec, Semaphore, strict_canonicalize, to_display_path, uri_to_path};
 use crate::{errloc, format_loc, some};
 
 #[derive(Deref)]
@@ -71,6 +71,8 @@ pub struct BackendConfig {
 	pub completions_limit: AtomicUsize,
 	#[default(200.into())]
 	pub references_limit: AtomicUsize,
+	/// Diagnostics configuration (thread-safe for concurrent access).
+	pub diagnostics: std::sync::RwLock<DiagnosticsConfig>,
 }
 
 #[derive(Deref, DerefMut, SmartDefault, Debug)]
@@ -123,6 +125,80 @@ pub enum Language {
 	Python,
 	Xml,
 	Javascript,
+	Csv,
+}
+
+/// Represents a symbol that can be renamed across the workspace.
+#[derive(Debug, Clone)]
+pub enum RenameableSymbol {
+	/// An XML ID (record ID), either qualified (module.id) or unqualified (id).
+	XmlId {
+		/// The fully qualified ID (module.id format).
+		qualified_id: String,
+		/// The current module context, used for resolving unqualified IDs.
+		current_module: Option<ModuleName>,
+	},
+	/// A model name (e.g., "sale.order").
+	ModelName(ModelName),
+	/// A template name (e.g., "web.Layout").
+	TemplateName(String),
+}
+
+impl RenameableSymbol {
+	/// Validates if the new name is valid for this symbol type.
+	pub fn validate_new_name(&self, new_name: &str) -> std::result::Result<(), String> {
+		if new_name.is_empty() {
+			return Err("Name cannot be empty".to_string());
+		}
+
+		match self {
+			RenameableSymbol::XmlId { .. } => {
+				// XML IDs: alphanumeric, underscores, and optionally one dot for qualification
+				let parts: Vec<&str> = new_name.split('.').collect();
+				if parts.len() > 2 {
+					return Err("XML ID can have at most one dot (module.id format)".to_string());
+				}
+				for part in parts {
+					if part.is_empty() {
+						return Err("XML ID parts cannot be empty".to_string());
+					}
+					if !part.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+						return Err("XML ID must start with a letter or underscore".to_string());
+					}
+					if !part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+						return Err("XML ID can only contain alphanumeric characters and underscores".to_string());
+					}
+				}
+				Ok(())
+			}
+			RenameableSymbol::ModelName(_) => {
+				// Model names: lowercase alphanumeric with dots (e.g., sale.order.line)
+				let parts: Vec<&str> = new_name.split('.').collect();
+				for part in parts {
+					if part.is_empty() {
+						return Err("Model name parts cannot be empty".to_string());
+					}
+					if !part.chars().next().map(|c| c.is_alphabetic()).unwrap_or(false) {
+						return Err("Model name parts must start with a letter".to_string());
+					}
+					if !part.chars().all(|c| c.is_alphanumeric() || c == '_') {
+						return Err("Model name can only contain alphanumeric characters and underscores".to_string());
+					}
+				}
+				Ok(())
+			}
+			RenameableSymbol::TemplateName(_) => {
+				// Template names: similar to XML IDs but can have multiple dots
+				if !new_name.chars().next().map(|c| c.is_alphabetic() || c == '_').unwrap_or(false) {
+					return Err("Template name must start with a letter or underscore".to_string());
+				}
+				if !new_name.chars().all(|c| c.is_alphanumeric() || c == '_' || c == '.') {
+					return Err("Template name can only contain alphanumeric characters, underscores, and dots".to_string());
+				}
+				Ok(())
+			}
+		}
+	}
 }
 
 pub struct Document {
@@ -149,6 +225,12 @@ impl Document {
 #[derive(Serialize, Deserialize)]
 pub struct CompletionData {
 	pub model: String,
+}
+
+/// Data stored in CallHierarchyItem.data field for call hierarchy operations.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CallHierarchyData {
+	pub callable: crate::call_graph::CallableId,
 }
 
 /// General-purpose methods.
@@ -252,7 +334,7 @@ impl Backend {
 					}
 				}
 				rope = document.rope.clone();
-				path = params.uri.to_file_path().unwrap();
+				path = uri_to_path(&params.uri)?;
 				let root_path = ok!(self.index.find_root_of(&path), "file not under any root");
 				root = _P(root_path);
 				eager_diagnostics = self.eager_diagnostics(params.open, &rope);
@@ -273,9 +355,9 @@ impl Backend {
 				let mut document = self.document_map.get_mut(params.uri.path().as_str()).unwrap();
 				self.on_change_python(&params.text, &params.uri, slice, params.old_rope)?;
 				if eager_diagnostics {
-					let file_path = params.uri.to_file_path().unwrap();
+					let file_path = uri_to_path(&params.uri)?;
 					self.diagnose_python(
-						file_path.to_str().unwrap(),
+						file_path.to_str().ok_or_else(|| errloc!("non-utf8 path: {:?}", file_path))?,
 						slice,
 						params.text.damage_zone(slice, None),
 						&mut document.diagnostics_cache,
@@ -315,7 +397,7 @@ impl Backend {
 		let uri = params.text_document.uri;
 		debug!("{}", uri.path().as_str());
 		let (_, extension) = ok!(uri.path().as_str().rsplit_once('.'), "no extension");
-		let path = uri.to_file_path().unwrap();
+		let path = uri_to_path(&uri)?;
 		let root = ok!(self.index.find_root_of(&path), "out of root");
 		let root = _P(&root);
 
@@ -388,8 +470,8 @@ impl Backend {
 			(Text::Delta(_), None) => Err(errloc!("(update_ast) got delta but no ast"))?,
 		};
 		let ast = ok!(ast, "No AST was parsed");
-		let file_path = uri.to_file_path().unwrap();
-		self.ast_map.insert(file_path.to_str().unwrap().to_string(), ast);
+		let file_path = uri_to_path(uri)?;
+		self.ast_map.insert(file_path.to_str().ok_or_else(|| errloc!("non-utf8 path: {:?}", file_path))?.to_string(), ast);
 		Ok(())
 	}
 	pub fn model_references(&self, path: &Path, model: &ModelName) -> anyhow::Result<Option<Vec<Location>>> {
@@ -436,6 +518,159 @@ impl Backend {
 			.take(limit);
 		Ok(Some(locations.collect()))
 	}
+
+	/// Checks if renaming the symbol to the new name would conflict with existing symbols.
+	/// Returns an error message if there's a conflict, None otherwise.
+	pub fn check_rename_conflicts(&self, symbol: &RenameableSymbol, new_name: &str) -> Option<String> {
+		match symbol {
+			RenameableSymbol::XmlId { current_module, .. } => {
+				// Check if the new XML ID already exists
+				let qualified_new = if new_name.contains('.') {
+					new_name.to_string()
+				} else if let Some(module) = current_module {
+					format!("{}.{}", _R(*module), new_name)
+				} else {
+					new_name.to_string()
+				};
+				if let Some(existing_id) = _G(&qualified_new) {
+					if self.index.records.get(&existing_id).is_some() {
+						return Some(format!("XML ID '{}' already exists", qualified_new));
+					}
+				}
+				None
+			}
+			RenameableSymbol::ModelName(_) => {
+				// Check if the new model name already exists
+				if let Some(new_model) = _G(new_name) {
+					if self.index.models.get(&new_model).is_some() {
+						return Some(format!("Model '{}' already exists", new_name));
+					}
+				}
+				None
+			}
+			RenameableSymbol::TemplateName(_) => {
+				// Check if the new template name already exists
+				if let Some(new_template) = _G(new_name) {
+					if self.index.templates.get(&new_template).is_some() {
+						return Some(format!("Template '{}' already exists", new_name));
+					}
+				}
+				None
+			}
+		}
+	}
+
+	/// Builds a WorkspaceEdit for renaming a symbol.
+	pub fn build_rename_edit(
+		&self,
+		symbol: &RenameableSymbol,
+		new_name: &str,
+		path: &Path,
+	) -> anyhow::Result<Option<WorkspaceEdit>> {
+		use std::collections::HashMap;
+
+		let mut changes: HashMap<Uri, Vec<TextEdit>> = HashMap::new();
+
+		match symbol {
+			RenameableSymbol::XmlId { qualified_id, current_module } => {
+				// Get the record definition location
+				let record_id = RecordId::from(some!(_G(qualified_id)));
+				if let Some(record) = self.index.records.get(&record_id) {
+					let def_loc: Location = record.location.clone().into();
+					// For the definition, we only rename the ID part (not the module prefix)
+					// The new name should also be just the ID part if unqualified
+					let new_id_part = if new_name.contains('.') {
+						new_name.split('.').last().unwrap_or(new_name)
+					} else {
+						new_name
+					};
+					changes.entry(def_loc.uri).or_default().push(TextEdit {
+						range: def_loc.range,
+						new_text: new_id_part.to_string(),
+					});
+				}
+
+				// Get all references (inherit_id references)
+				if let Ok(Some(refs)) = self.record_references(path, qualified_id, *current_module) {
+					for loc in refs {
+						// For references, determine if they use qualified or unqualified form
+						// and update accordingly
+						let new_ref_name = if qualified_id.contains('.') && new_name.contains('.') {
+							new_name.to_string()
+						} else if !qualified_id.contains('.') && !new_name.contains('.') {
+							new_name.to_string()
+						} else if new_name.contains('.') {
+							// new name is qualified, use it directly
+							new_name.to_string()
+						} else if let Some(module) = current_module {
+							// new name is unqualified, qualify it for cross-module refs
+							format!("{}.{}", _R(*module), new_name)
+						} else {
+							new_name.to_string()
+						};
+
+						changes.entry(loc.uri).or_default().push(TextEdit {
+							range: loc.range,
+							new_text: new_ref_name,
+						});
+					}
+				}
+			}
+			RenameableSymbol::ModelName(model_name) => {
+				// Get the model definition location(s)
+				if let Some(entry) = self.index.models.get(model_name) {
+					// Base definition
+					if let Some(base) = &entry.base {
+						let loc: Location = base.0.clone().into();
+						changes.entry(loc.uri).or_default().push(TextEdit {
+							range: loc.range,
+							new_text: new_name.to_string(),
+						});
+					}
+					// All _inherit locations
+					for desc in &entry.descendants {
+						let loc: Location = desc.0.clone().into();
+						changes.entry(loc.uri).or_default().push(TextEdit {
+							range: loc.range,
+							new_text: new_name.to_string(),
+						});
+					}
+				}
+
+				// Get all XML references (model="..." attributes)
+				if let Ok(Some(refs)) = self.model_references(path, model_name) {
+					for loc in refs {
+						changes.entry(loc.uri).or_default().push(TextEdit {
+							range: loc.range,
+							new_text: new_name.to_string(),
+						});
+					}
+				}
+			}
+			RenameableSymbol::TemplateName(template_name) => {
+				// Get all template references
+				if let Ok(Some(refs)) = self.index.template_references(template_name, true) {
+					for loc in refs {
+						changes.entry(loc.uri).or_default().push(TextEdit {
+							range: loc.range,
+							new_text: new_name.to_string(),
+						});
+					}
+				}
+			}
+		}
+
+		if changes.is_empty() {
+			Ok(None)
+		} else {
+			Ok(Some(WorkspaceEdit {
+				changes: Some(changes),
+				document_changes: None,
+				change_annotations: None,
+			}))
+		}
+	}
+
 	/// The main entrypoint for configuration changes.
 	///
 	/// If `roots` is not given, only `project_config` will be updated.
@@ -445,6 +680,7 @@ impl Backend {
 			references,
 			module,
 			completions,
+			diagnostics,
 		} = config;
 
 		let Some(root) = root else {
@@ -457,6 +693,11 @@ impl Backend {
 			}
 			if let Some(limit) = symbols.and_then(|c| c.limit) {
 				self.project_config.symbols_limit.store(limit, Relaxed);
+			}
+			if let Some(diag_config) = diagnostics {
+				if let Ok(mut guard) = self.project_config.diagnostics.write() {
+					*guard = diag_config;
+				}
 			}
 			if let Some(ModuleConfig { roots: Some(roots) }) = module.as_ref() {
 				for root in roots {
@@ -471,6 +712,13 @@ impl Backend {
 			references: references.unwrap_or_default(),
 			completions: completions.unwrap_or_default(),
 		};
+
+		// Update global diagnostics config
+		if let Some(diag_config) = diagnostics {
+			if let Ok(mut guard) = self.project_config.diagnostics.write() {
+				*guard = diag_config;
+			}
+		}
 
 		let Some(ModuleConfig { roots: Some(subroots) }) = module else {
 			self.workspaces.insert(root.to_path_buf(), root_config);
@@ -545,9 +793,23 @@ impl Backend {
 				let contents = Cow::from(&rope);
 				let root = some!(top_level_stmt(ast.root_node(), offset));
 				let needle = some!(root.named_descendant_for_byte_range(offset, offset));
-				let (type_, _) =
-					some!((self.index).type_of_range(root, needle.byte_range().map_unit(ByteOffset), &contents));
-				Ok(Some(format!("{type_:?}").replacen("Text::", "", 1)))
+
+				// Get the path symbol for function resolution
+				let current_path = self.index.find_root_of(&file_path).map(|root_path| {
+					let root_spur = _I(root_path.to_string_lossy());
+					PathSymbol::strip_root(root_spur, &file_path)
+				});
+
+				let (type_id, _) = some!((self.index).type_of_range_with_path(
+					root,
+					needle.byte_range().map_unit(ByteOffset),
+					&contents,
+					current_path
+				));
+				// Use type_display for proper formatting, fall back to debug format
+				let display = self.index.type_display(type_id)
+					.unwrap_or_else(|| format!("{type_id:?}").replacen("Text::", "", 1));
+				Ok(Some(display))
 			}
 			Some("xml") => {
 				let res = some!(self.xml_debug_inspect_type(params, rope.slice(..)).ok().flatten());
@@ -797,6 +1059,88 @@ impl Index {
 		});
 		items.extend(completions);
 		Ok(())
+	}
+	/// Complete attributes of odoo.api.Environment (e.g., user, company, ref)
+	pub fn complete_env_attributes(
+		&self,
+		needle: &str,
+		range: ByteRange,
+		rope: RopeSlice<'_>,
+		items: &mut MaxVec<CompletionItem>,
+	) -> anyhow::Result<()> {
+		use crate::analyze::{EnvAttrKind, ENV_ATTRIBUTES};
+
+		if !items.has_space() {
+			return Ok(());
+		}
+		let range = rope_conv(range, rope);
+		let completions = ENV_ATTRIBUTES.iter().filter_map(|attr| {
+			if !needle.is_empty() && !attr.name.starts_with(needle) {
+				return None;
+			}
+			let kind = match attr.kind {
+				EnvAttrKind::Model => CompletionItemKind::FIELD,
+				EnvAttrKind::Method => CompletionItemKind::METHOD,
+				EnvAttrKind::Property => CompletionItemKind::PROPERTY,
+			};
+			let mut new_text = attr.name.to_string();
+			let mut insert_text_format = None;
+			if attr.kind == EnvAttrKind::Method {
+				new_text.push_str("(${1:})$0");
+				insert_text_format = Some(InsertTextFormat::SNIPPET);
+			}
+			Some(CompletionItem {
+				label: attr.name.to_string(),
+				kind: Some(kind),
+				label_details: Some(CompletionItemLabelDetails {
+					detail: Some(format!(" {}", attr.type_display)),
+					description: None,
+				}),
+				insert_text_format,
+				text_edit: Some(CompletionTextEdit::Edit(TextEdit { range, new_text })),
+				..Default::default()
+			})
+		});
+		items.extend(completions);
+		Ok(())
+	}
+	/// Hover information for an Environment attribute
+	pub fn hover_env_attribute(&self, attr_name: &str, range: Option<Range>) -> anyhow::Result<Option<Hover>> {
+		use crate::analyze::ENV_ATTRIBUTES;
+
+		let attr = ENV_ATTRIBUTES.iter().find(|a| a.name == attr_name);
+		let Some(attr) = attr else {
+			return Ok(None);
+		};
+
+		let value = fomat! {
+			"```py\n"
+			"(env) " (attr.name) ": " (attr.type_display)
+			"\n```"
+		};
+		Ok(Some(Hover {
+			range,
+			contents: HoverContents::Markup(MarkupContent {
+				kind: MarkupKind::Markdown,
+				value,
+			}),
+		}))
+	}
+	/// Jump to definition for an Environment attribute (jumps to the model if applicable)
+	pub fn jump_def_env_attribute(&self, attr_name: &str) -> anyhow::Result<Option<Location>> {
+		use crate::analyze::ENV_ATTRIBUTES;
+
+		let attr = ENV_ATTRIBUTES.iter().find(|a| a.name == attr_name);
+		let Some(attr) = attr else {
+			return Ok(None);
+		};
+
+		// If this attribute returns a model, jump to the model definition
+		if let Some(model_name) = attr.model {
+			return self.jump_def_model(model_name);
+		}
+
+		Ok(None)
 	}
 	pub fn complete_template_name(
 		&self,
@@ -1094,6 +1438,74 @@ impl Index {
 			method.locations.iter().map(|loc| loc.deref().clone().into()).collect(),
 		))
 	}
+
+	/// Build a CallHierarchyItem for a callable (method or function).
+	pub fn build_call_hierarchy_item(
+		&self,
+		callable: &crate::call_graph::CallableId,
+	) -> Option<CallHierarchyItem> {
+		use crate::call_graph::CallableId;
+
+		match callable {
+			CallableId::Method { model, method } => {
+				// Look up the method in the model index
+				let model_key = _G(model)?;
+				let entry = self.models.populate_properties(model_key.into(), &[])?;
+				let method_key = _G(method)?;
+				let method_info = entry.methods.as_ref()?.get(&method_key)?;
+
+				// Get the first active location
+				let location = method_info
+					.locations
+					.iter()
+					.find(|loc| loc.active)?;
+
+				let uri: Uri = format!("file://{}", location.path).parse().ok()?;
+
+				Some(CallHierarchyItem {
+					name: method.clone(),
+					kind: SymbolKind::METHOD,
+					tags: None,
+					detail: Some(model.clone()),
+					uri,
+					range: location.range,
+					selection_range: location.range,
+					data: serde_json::to_value(CallHierarchyData {
+						callable: callable.clone(),
+					})
+					.ok(),
+				})
+			}
+			CallableId::Function { path, name } => {
+				// Look up the function in the function index by path string and name
+				let func_key = _G(name)?;
+				let file_path = std::path::Path::new(path);
+				let (_, func_info) = self.functions.find_in_file(file_path, &func_key.into())?;
+
+				// Check if the function location is active
+				if !func_info.location.active {
+					return None;
+				}
+
+				let uri: Uri = format!("file://{}", func_info.location.path).parse().ok()?;
+
+				Some(CallHierarchyItem {
+					name: name.clone(),
+					kind: SymbolKind::FUNCTION,
+					tags: None,
+					detail: Some(path.clone()),
+					uri,
+					range: func_info.location.range,
+					selection_range: func_info.location.range,
+					data: serde_json::to_value(CallHierarchyData {
+						callable: callable.clone(),
+					})
+					.ok(),
+				})
+			}
+		}
+	}
+
 	pub fn hover_record(&self, xml_id: &str, range: Option<Range>) -> anyhow::Result<Option<Hover>> {
 		let key = some!(_G(xml_id));
 		let record = some!(self.records.get(&key));

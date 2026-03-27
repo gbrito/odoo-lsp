@@ -1,0 +1,11 @@
+{
+  "module": {
+    "roots": ["."]
+  },
+  "completions": {
+    "limit": 100
+  },
+  "diagnostics": {
+    "xml_validation": false
+  }
+}

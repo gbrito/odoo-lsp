@@ -1,0 +1,30 @@
+<odoo>
+    <!-- ^symbol main_company -->
+    <!-- ^symbol main_partner -->
+    <!-- ^symbol partner_form -->
+
+    <record id="main_company" model="res.company">
+        <field name="name">Main Company</field>
+    </record>
+
+    <record id="main_partner" model="res.partner">
+        <field name="name">Main Partner</field>
+        <field name="company_id" ref="main_company"/>
+        <!--                                      ^hint res.company -->
+    </record>
+
+    <record id="partner_form" model="ir.ui.view">
+        <field name="name">Partner Form</field>
+        <field name="model">res.partner</field>
+        <field name="arch" type="xml">
+            <form>
+                <field name="name"/>
+                <!--            ^hint Char -->
+                <field name="email"/>
+                <!--             ^hint Char -->
+                <field name="company_id"/>
+                <!--                   ^hint Many2one[res.company] -->
+            </form>
+        </field>
+    </record>
+</odoo>

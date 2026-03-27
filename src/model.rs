@@ -30,6 +30,8 @@ pub struct Model {
 	pub type_: ModelType,
 	pub range: Range,
 	pub byte_range: ByteRange,
+	/// The base class type (Model, TransientModel, AbstractModel)
+	pub base_type: ModelBaseType,
 }
 
 #[derive(Clone, Debug)]
@@ -56,6 +58,31 @@ impl ModelType {
 	}
 }
 
+/// The base class type of an Odoo model.
+///
+/// This determines the model's behavior and security requirements:
+/// - `Model`: Regular persistent model, requires access rules
+/// - `TransientModel`: Wizard/temporary model, still requires access rules
+/// - `AbstractModel`: Abstract mixin, cannot have access rules (not persisted)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ModelBaseType {
+	#[default]
+	Model,
+	TransientModel,
+	AbstractModel,
+}
+
+impl ModelBaseType {
+	/// Parse from the class name in Python (e.g., "Model", "TransientModel", "AbstractModel")
+	pub fn from_class_name(name: &str) -> Self {
+		match name {
+			"TransientModel" => Self::TransientModel,
+			"AbstractModel" => Self::AbstractModel,
+			_ => Self::Model,
+		}
+	}
+}
+
 #[derive(SmartDefault)]
 pub struct ModelIndex {
 	#[default(_code = "DashMap::with_shard_amount(4)")]
@@ -75,6 +102,8 @@ pub struct ModelEntry {
 	pub properties_by_prefix: qp_trie::Trie<&'static [u8], PropertyKind>,
 	pub docstring: Option<ImStr>,
 	pub deleted: bool,
+	/// The base class type (Model, TransientModel, AbstractModel)
+	pub base_type: ModelBaseType,
 }
 
 #[derive(Clone, Debug)]
@@ -97,12 +126,21 @@ pub enum PropertyInfo {
 	Method,
 }
 
+/// Selection field choice: (value, label) pair
+pub type SelectionChoice = (ImStr, ImStr);
+
 #[derive(Clone, Debug)]
 pub struct Field {
 	pub kind: FieldKind,
 	pub type_: Spur,
 	pub location: TrackedMinLoc,
 	pub help: Option<ImStr>,
+	/// Selection choices for Selection fields: Vec of (value, label) pairs.
+	/// `None` for non-Selection fields or dynamic selections (method/callable).
+	pub choices: Option<Arc<[SelectionChoice]>>,
+	/// Definition path for Properties fields: "many2one_field.properties_definition_field".
+	/// `None` for non-Properties fields or when definition is not specified.
+	pub definition: Option<ImStr>,
 }
 
 #[derive(Debug, SmartDefault)]
@@ -127,18 +165,138 @@ impl Clone for Method {
 	}
 }
 
+/// Represents a module-level (freestanding) function.
+#[derive(Debug)]
+pub struct Function {
+	pub location: TrackedMinLoc,
+	pub docstring: Option<ImStr>,
+	pub arguments: Option<Box<[FunctionParam]>>,
+	pub pending_eval: AtomicBool,
+	pub eval_cache: Cache<Vec<TypeId>, TypeId>,
+}
+
+impl Function {
+	pub fn new(location: MinLoc) -> Self {
+		Self {
+			location: location.into(),
+			docstring: None,
+			arguments: None,
+			pending_eval: AtomicBool::new(false),
+			eval_cache: Cache::new(8),
+		}
+	}
+}
+
+impl Clone for Function {
+	fn clone(&self) -> Self {
+		Self {
+			location: self.location.clone(),
+			docstring: self.docstring.clone(),
+			arguments: self.arguments.clone(),
+			pending_eval: AtomicBool::new(false),
+			eval_cache: Cache::new(8),
+		}
+	}
+}
+
+/// Index of module-level functions, keyed by (file path, function name).
+#[derive(SmartDefault)]
+pub struct FunctionIndex {
+	#[default(_code = "DashMap::with_shard_amount(4)")]
+	inner: DashMap<PathSymbol, HashMap<Symbol<Function>, Arc<Function>>>,
+}
+
+impl FunctionIndex {
+	/// Get or create functions map for a file.
+	pub fn get_or_create(&self, path: PathSymbol) -> RefMut<'_, PathSymbol, HashMap<Symbol<Function>, Arc<Function>>> {
+		self.inner.entry(path).or_default()
+	}
+
+	/// Get functions for a file (read-only).
+	pub fn get(&self, path: &PathSymbol) -> Option<dashmap::mapref::one::Ref<'_, PathSymbol, HashMap<Symbol<Function>, Arc<Function>>>> {
+		self.inner.get(path)
+	}
+
+	/// Try to get a mutable reference to functions for a file.
+	pub fn try_get_mut(&self, path: &PathSymbol) -> TryResult<RefMut<'_, PathSymbol, HashMap<Symbol<Function>, Arc<Function>>>> {
+		self.inner.try_get_mut(path)
+	}
+
+	/// Check if a function exists in a file.
+	pub fn contains(&self, path: &PathSymbol, name: &Symbol<Function>) -> bool {
+		self.inner.get(path).is_some_and(|funcs| funcs.contains_key(name))
+	}
+
+	/// Add or update functions from a file.
+	pub fn append(&self, path: PathSymbol, functions: impl IntoIterator<Item = (Symbol<Function>, MinLoc)>) {
+		let mut entry = self.inner.entry(path).or_default();
+		for (name, location) in functions {
+			match entry.entry(name) {
+				Entry::Vacant(vacant) => {
+					vacant.insert(Arc::new(Function::new(location)));
+				}
+				Entry::Occupied(mut occupied) => {
+					// Update existing function's location
+					Arc::make_mut(occupied.get_mut()).location = location.into();
+				}
+			}
+		}
+	}
+
+	/// Clear functions for a file (used when re-indexing).
+	pub fn clear_file(&self, path: &PathSymbol) {
+		if let Some(mut entry) = self.inner.get_mut(path) {
+			entry.clear();
+		}
+	}
+
+	/// Look up a function by name across all files.
+	/// Returns the first matching function found.
+	pub fn find_by_name(&self, name: &Symbol<Function>) -> Option<(PathSymbol, Arc<Function>)> {
+		for entry in self.inner.iter() {
+			if let Some(func) = entry.value().get(name) {
+				return Some((*entry.key(), Arc::clone(func)));
+			}
+		}
+		None
+	}
+
+	/// Look up a function by name in a file specified by its path string.
+	/// Returns the PathSymbol and function if found.
+	pub fn find_in_file(&self, file_path: &std::path::Path, name: &Symbol<Function>) -> Option<(PathSymbol, Arc<Function>)> {
+		for entry in self.inner.iter() {
+			// Compare the full path
+			if entry.key().to_path() == file_path {
+				if let Some(func) = entry.value().get(name) {
+					return Some((*entry.key(), Arc::clone(func)));
+				}
+			}
+		}
+		None
+	}
+}
+
 #[derive(Deref, DerefMut, Clone, Debug)]
 pub struct TrackedMinLoc {
 	#[deref]
 	#[deref_mut]
 	inner: MinLoc,
 	pub active: bool,
+	/// Whether this method location contains a super() call
+	pub calls_super: bool,
 }
 
 impl From<MinLoc> for TrackedMinLoc {
 	#[inline]
 	fn from(inner: MinLoc) -> Self {
-		Self { inner, active: true }
+		Self { inner, active: true, calls_super: false }
+	}
+}
+
+impl TrackedMinLoc {
+	/// Create a new TrackedMinLoc with calls_super information
+	pub fn with_super(inner: MinLoc, calls_super: bool) -> Self {
+		Self { inner, active: true, calls_super }
 	}
 }
 
@@ -150,6 +308,8 @@ impl Field {
 			type_,
 			location,
 			help,
+			choices,
+			definition,
 		} = other;
 		debug!("TODO Field inheritance location {location:?}");
 		match &mut self_.kind {
@@ -161,29 +321,58 @@ impl Field {
 		if let Some(help) = help {
 			self_.help = Some(help.clone());
 		}
+		// Handle selection_add: merge choices from inherited field
+		if let Some(new_choices) = choices {
+			if let Some(existing) = &self_.choices {
+				// Merge: existing choices + new choices (selection_add behavior)
+				let mut merged: Vec<SelectionChoice> = existing.iter().cloned().collect();
+				for choice in new_choices.iter() {
+					// Only add if not already present (by value)
+					if !merged.iter().any(|(v, _)| v == &choice.0) {
+						merged.push(choice.clone());
+					}
+				}
+				self_.choices = Some(merged.into());
+			} else {
+				self_.choices = Some(Arc::clone(new_choices));
+			}
+		}
+		// Handle definition for Properties fields
+		if let Some(def) = definition {
+			self_.definition = Some(def.clone());
+		}
 		self_
 	}
 }
 
 impl Method {
-	pub fn add_override(self: &mut Arc<Self>, location: MinLoc, top_level_scope: Option<Range>, base: bool) {
+	pub fn add_override(
+		self: &mut Arc<Self>,
+		location: MinLoc,
+		top_level_scope: Option<Range>,
+		calls_super: bool,
+	) {
 		let self_ = Arc::make_mut(self);
+		let tracked_loc = TrackedMinLoc::with_super(location.clone(), calls_super);
+		
 		let Some((idx, _)) = self_
 			.locations
 			.iter()
 			.enumerate()
 			.rfind(|(_, loc)| loc.path == location.path)
 		else {
-			if base {
-				self_.locations.insert(0, location.into());
+			// Methods that don't call super are considered "base" implementations
+			// and are inserted at the front for resolution order
+			if !calls_super {
+				self_.locations.insert(0, tracked_loc);
 			} else {
-				self_.locations.push(location.into());
+				self_.locations.push(tracked_loc);
 			}
 			return;
 		};
 
 		let Some(top_level_scope) = top_level_scope else {
-			self_.locations.insert(idx + 1, location.into());
+			self_.locations.insert(idx + 1, tracked_loc);
 			return;
 		};
 
@@ -194,10 +383,11 @@ impl Method {
 		}) {
 			loc.range = location.range;
 			loc.active = true;
+			loc.calls_super = calls_super;
 			return;
 		}
 
-		self_.locations.insert(idx + 1, location.into());
+		self_.locations.insert(idx + 1, tracked_loc);
 	}
 	pub fn merge(self: &mut Arc<Self>, other: &Self) {
 		let self_ = Arc::make_mut(self);
@@ -326,7 +516,7 @@ impl Deref for ModelIndex {
 
 #[rustfmt::skip]
 query! {
-	ModelProperties(Field, Type, Relation, Arg, Value, Method, MethodBody);
+	ModelProperties(Field, Type, Relation, Arg, Value, Method, MethodBody, SelectionList, SelectionVar);
 ((class_definition
   (block
     (expression_statement
@@ -335,7 +525,10 @@ query! {
         (call [
           (identifier) @TYPE
           (attribute (identifier) @_fields (identifier) @TYPE) ]
-          (argument_list . ((comment)* . (string) @RELATION)?
+          (argument_list 
+            . ((comment)* . (string) @RELATION)?
+            . ((comment)* . (list) @SELECTION_LIST)?
+            . ((comment)* . (identifier) @SELECTION_VAR)?
             ((keyword_argument (identifier) @ARG (_) @VALUE) ","?)*))))))
   (#eq? @_fields "fields")
   (#match? @TYPE "^[A-Z]"))
@@ -347,20 +540,159 @@ query! {
       (function_definition (identifier) @METHOD) @METHOD_BODY) ]))
 }
 
-#[derive(Debug)]
-pub enum ResolveMappedError {
-	NonRelational,
+// Query to find module-level list assignments (for resolving selection variable references)
+#[rustfmt::skip]
+query! {
+	ModuleLevelLists(Name, List);
+(module
+  (expression_statement
+    (assignment
+      left: (identifier) @NAME
+      right: (list) @LIST)))
 }
 
-impl Display for ResolveMappedError {
-	fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-		match self {
-			Self::NonRelational => f.write_str("Tried to access a field on a non-relational field"),
+/// Check if a function body contains a call to `super()`.
+/// Uses AST traversal to avoid false positives from comments or strings.
+fn has_super_call(body: Node, source: &[u8]) -> bool {
+	let mut cursor = body.walk();
+	
+	// DFS through the body looking for call nodes with super
+	let mut stack = vec![body];
+	while let Some(node) = stack.pop() {
+		if node.kind() == "call" {
+			// Check if this is a super() call
+			if let Some(func) = node.child_by_field_name("function") {
+				// super() - direct call
+				if func.kind() == "identifier" {
+					if let Ok(name) = func.utf8_text(source) {
+						if name == "super" {
+							return true;
+						}
+					}
+				}
+				// super(...).method() - attribute access on super call
+				if func.kind() == "attribute" {
+					if let Some(obj) = func.child_by_field_name("object") {
+						if obj.kind() == "call" {
+							if let Some(inner_func) = obj.child_by_field_name("function") {
+								if inner_func.kind() == "identifier" {
+									if let Ok(name) = inner_func.utf8_text(source) {
+										if name == "super" {
+											return true;
+										}
+									}
+								}
+							}
+						}
+					}
+				}
+			}
 		}
+		
+		// Add children to stack for traversal
+		cursor.reset(node);
+		if cursor.goto_first_child() {
+			loop {
+				stack.push(cursor.node());
+				if !cursor.goto_next_sibling() {
+					break;
+				}
+			}
+		}
+	}
+	
+	false
+}
+
+/// Parse a selection list node into a vector of (value, label) pairs.
+/// Expects a list of tuples: `[('value1', 'Label 1'), ('value2', 'Label 2')]`
+pub fn parse_selection_list(list_node: Node, contents: &str) -> Option<Vec<SelectionChoice>> {
+	let mut choices = Vec::new();
+	let mut cursor = list_node.walk();
+	
+	for child in list_node.named_children(&mut cursor) {
+		if child.kind() == "tuple" {
+			let mut tuple_cursor = child.walk();
+			let mut children = child.named_children(&mut tuple_cursor);
+			
+			// Get first element (value)
+			let value_node = children.next()?;
+			if value_node.kind() != "string" {
+				continue;
+			}
+			let value = &contents[value_node.byte_range()];
+			let value = value.trim_matches(|c| c == '"' || c == '\'');
+			
+			// Get second element (label) - optional for selection_add singletons
+			let label = if let Some(label_node) = children.next() {
+				if label_node.kind() == "string" {
+					let label = &contents[label_node.byte_range()];
+					label.trim_matches(|c| c == '"' || c == '\'')
+				} else {
+					value // Use value as label if not a string
+				}
+			} else {
+				value // Singleton tuple: ('value',) - use value as label
+			};
+			
+			choices.push((ImStr::from(value), ImStr::from(label)));
+		}
+	}
+	
+	if choices.is_empty() {
+		None
+	} else {
+		Some(choices)
 	}
 }
 
-impl core::error::Error for ResolveMappedError {}
+/// Resolve a variable reference to a list in the same file.
+/// Searches for module-level assignments like `STATES = [...]`
+fn resolve_selection_variable(var_name: &str, ast: &tree_sitter::Tree, contents: &str) -> Option<Vec<SelectionChoice>> {
+	let query = ModuleLevelLists::query();
+	let mut cursor = QueryCursor::new();
+	let mut matches = cursor.matches(query, ast.root_node(), contents.as_bytes());
+	
+	while let Some(match_) = matches.next() {
+		let mut name_node = None;
+		let mut list_node = None;
+		
+		for capture in match_.captures {
+			match ModuleLevelLists::from(capture.index) {
+				Some(ModuleLevelLists::Name) => name_node = Some(capture.node),
+				Some(ModuleLevelLists::List) => list_node = Some(capture.node),
+				None => {}
+			}
+		}
+		
+		if let (Some(name), Some(list)) = (name_node, list_node) {
+			let name_str = &contents[name.byte_range()];
+			if name_str == var_name {
+				return parse_selection_list(list, contents);
+			}
+		}
+	}
+	
+	None
+}
+
+/// Errors that can occur when resolving a mapped field path (e.g., "partner_id.name").
+#[derive(Debug, thiserror::Error)]
+pub enum ResolveMappedError {
+	/// Tried to access a field on a non-relational field.
+	#[error("Tried to access a field on a non-relational field")]
+	NonRelational,
+
+	/// The path traversed a Properties field, which supports dynamic property access.
+	/// The remaining path after the Properties field is stored in the `remaining` field.
+	#[error("Accessed property '{remaining}' on Properties field '{field_name}'")]
+	Properties {
+		/// The name of the Properties field that was traversed.
+		field_name: String,
+		/// The remaining path after the Properties field (e.g., "my_property" for "props.my_property").
+		remaining: String,
+	},
+}
 
 impl ModelIndex {
 	pub fn append(&self, path: PathSymbol, replace: bool, items: &[Model]) {
@@ -385,6 +717,8 @@ impl ModelIndex {
 						entry
 							.ancestors
 							.extend(ancestors.iter().map(|sym| ModelName::from(_I(sym))));
+						// Set the base type from the model definition
+						entry.base_type = item.base_type;
 					} else if let Some(base) = entry.base.as_ref() {
 						warn!(
 							"Conflicting bases for {}:\nfirst={base}\n  new={}",
@@ -421,6 +755,8 @@ impl ModelIndex {
 						entry
 							.ancestors
 							.extend(ancestors.iter().map(|sym| ModelName::from(_I(sym))));
+						// Note: For inherit-only classes, we don't override base_type
+						// as it should come from the base model definition
 					}
 				}
 			}
@@ -465,10 +801,7 @@ impl ModelIndex {
 				let contents = test_utils::fs::read_to_string(&fpath)
 					.map_err(|err| error!("Failed to read {}:\n{err}", fpath.display()))
 					.ok()?;
-				let mut parser = Parser::new();
-				parser
-					.set_language(&tree_sitter_python::LANGUAGE.into())
-					.expect(format_loc!("Failed to set language"));
+				let mut parser = python_parser();
 				let ast = parser.parse(&contents, None)?;
 				let byte_range = byte_range.erase();
 				let mut cursor = QueryCursor::new();
@@ -479,14 +812,22 @@ impl ModelIndex {
 					let mut field = None;
 					let mut type_ = None;
 					let mut is_relational = false;
+					let mut is_selection = false;
+					let mut is_properties = false;
 					let mut relation = None;
 					let mut kwarg = None::<Kwargs>;
 					let mut help = None;
 					let mut related = None;
+					let mut definition = None;
+					let mut selection_list = None::<Node>;
+					let mut selection_var = None::<&str>;
 					enum Kwargs {
 						ComodelName,
 						Help,
 						Related,
+						Selection,
+						SelectionAdd,
+						Definition,
 					}
 					let mut method_name = None;
 					let mut method_body = None;
@@ -495,25 +836,38 @@ impl ModelIndex {
 							Some(ModelProperties::Field) => {
 								field = Some(capture.node);
 							}
-							Some(ModelProperties::Type) => {
-								type_ = Some(capture.node.byte_range());
-								// TODO: fields.Reference
-								is_relational = matches!(
-									&contents[capture.node.byte_range()],
-									"One2many" | "Many2one" | "Many2many"
-								);
-							}
+						Some(ModelProperties::Type) => {
+							type_ = Some(capture.node.byte_range());
+							let type_str = &contents[capture.node.byte_range()];
+							// TODO: fields.Reference
+							is_relational = matches!(type_str, "One2many" | "Many2one" | "Many2many");
+							is_selection = type_str == "Selection";
+							is_properties = type_str == "Properties";
+						}
 							Some(ModelProperties::Relation) => {
 								if is_relational {
 									relation = Some(capture.node.byte_range().shrink(1));
 								}
 							}
-							Some(ModelProperties::Arg) => match &contents[capture.node.byte_range()] {
-								"comodel_name" if is_relational => kwarg = Some(Kwargs::ComodelName),
-								"help" => kwarg = Some(Kwargs::Help),
-								"related" => kwarg = Some(Kwargs::Related),
-								_ => kwarg = None,
-							},
+							Some(ModelProperties::SelectionList) => {
+								if is_selection {
+									selection_list = Some(capture.node);
+								}
+							}
+							Some(ModelProperties::SelectionVar) => {
+								if is_selection {
+									selection_var = Some(&contents[capture.node.byte_range()]);
+								}
+							}
+						Some(ModelProperties::Arg) => match &contents[capture.node.byte_range()] {
+							"comodel_name" if is_relational => kwarg = Some(Kwargs::ComodelName),
+							"help" => kwarg = Some(Kwargs::Help),
+							"related" => kwarg = Some(Kwargs::Related),
+							"selection" if is_selection => kwarg = Some(Kwargs::Selection),
+							"selection_add" if is_selection => kwarg = Some(Kwargs::SelectionAdd),
+							"definition" if is_properties => kwarg = Some(Kwargs::Definition),
+							_ => kwarg = None,
+						},
 							Some(ModelProperties::Value) => match kwarg {
 								Some(Kwargs::ComodelName) => {
 									if capture.node.kind() == "string" {
@@ -530,7 +884,21 @@ impl ModelIndex {
 										related = Some(capture.node.byte_range().shrink(1));
 									}
 								}
-								None => {}
+							Some(Kwargs::Selection) | Some(Kwargs::SelectionAdd) => {
+								// selection= or selection_add= keyword argument
+								if capture.node.kind() == "list" {
+									selection_list = Some(capture.node);
+								} else if capture.node.kind() == "identifier" {
+									selection_var = Some(&contents[capture.node.byte_range()]);
+								}
+							}
+							Some(Kwargs::Definition) => {
+								// definition= for Properties fields
+								if capture.node.kind() == "string" {
+									definition = Some(capture.node.byte_range().shrink(1));
+								}
+							}
+							None => {}
 							},
 							Some(ModelProperties::Method) => {
 								method_name = Some(capture.node);
@@ -547,7 +915,7 @@ impl ModelIndex {
 						let range = span_conv(field.range());
 						let field_str = &contents[field.byte_range()];
 						let field = _I(field_str);
-						let type_ = &contents[type_];
+						let type_str = &contents[type_];
 						let location = MinLoc {
 							path: location.path,
 							range,
@@ -562,11 +930,29 @@ impl ModelIndex {
 							FieldKind::Related(contents[related].into())
 						} else {
 							if is_relational {
-								debug!("is_relational but no relation found: field={field_str} type={type_}");
+								debug!("is_relational but no relation found: field={field_str} type={type_str}");
 							}
 							FieldKind::Value
 						};
-						let type_ = _I(type_);
+						
+						// Parse selection choices
+						let choices = if is_selection {
+							if let Some(list_node) = selection_list {
+								parse_selection_list(list_node, &contents)
+									.map(|v| v.into())
+							} else if let Some(var_name) = selection_var {
+								// Try to resolve variable reference
+								resolve_selection_variable(var_name, &ast, &contents)
+									.map(|v| v.into())
+							} else {
+								None
+							}
+						} else {
+							None
+						};
+						
+						let type_ = _I(type_str);
+						let definition = definition.map(|r| contents[r].into());
 						fields.push((
 							field,
 							Field {
@@ -574,6 +960,8 @@ impl ModelIndex {
 								type_,
 								location,
 								help,
+								choices,
+								definition,
 							},
 						))
 					}
@@ -581,7 +969,7 @@ impl ModelIndex {
 						&& let Some(body) = method_body
 					{
 						let method_str = &contents[method.byte_range()];
-						let calls_super = contents[body.byte_range()].contains("super(");
+						let calls_super = has_super_call(body, contents.as_bytes());
 						let method = _I(method_str);
 						let range = span_conv(body.range());
 						let top_level_scope = ast
@@ -691,12 +1079,12 @@ impl ModelIndex {
 				Entry::Occupied(mut old_method) => {
 					old_method
 						.get_mut()
-						.add_override(method_location, top_level_scope, !calls_super);
+						.add_override(method_location, top_level_scope, calls_super);
 				}
 				Entry::Vacant(empty) => {
 					empty.insert(
 						Method {
-							locations: vec![method_location.into()],
+							locations: vec![TrackedMinLoc::with_super(method_location, calls_super)],
 							..Default::default()
 						}
 						.into(),
@@ -729,6 +1117,29 @@ impl ModelIndex {
 		entry.properties_by_prefix = properties_set;
 		Some(entry)
 	}
+
+	/// Get all model names that have definitions in a given file.
+	/// Returns a list of (model_name, is_inheriting) pairs.
+	/// `is_inheriting` is true if the file contains a descendant (inheriting class) of the model,
+	/// which means methods defined there could be overriding parent methods.
+	pub fn models_in_file(&self, path: &PathSymbol) -> Vec<(ModelName, bool)> {
+		self.iter()
+			.filter_map(|entry| {
+				let is_base = entry.base.as_ref().is_some_and(|b| &b.0.path == path);
+				let is_descendant = entry.descendants.iter().any(|d| &d.0.path == path);
+				if is_base || is_descendant {
+					// A model is "inheriting" if:
+					// 1. The file contains a descendant (not the base), OR
+					// 2. The model has ancestors (multi-inheritance case)
+					let is_inheriting = is_descendant || !entry.ancestors.is_empty();
+					Some((*entry.key(), is_inheriting))
+				} else {
+					None
+				}
+			})
+			.collect()
+	}
+
 	/// Splits a mapped access expression, e.g. `foo.bar.baz`, and traverses until the expression is exhausted.
 	///
 	/// For completing a `Model.write({'foo.bar.baz': ..})`:
@@ -756,12 +1167,22 @@ impl ModelIndex {
 					debug!("tried to resolve before fields are populated for `{}`", _R(*model));
 					return Ok(());
 				};
-				let field = _G(lhs);
-				let field = field.and_then(|field| model_entry.fields.as_ref()?.get(&field));
-				match field.as_ref().map(|f| &f.kind) {
-					Some(FieldKind::Relational(rel)) => resolved = Some(*rel),
-					None | Some(FieldKind::Value) => return Err(ResolveMappedError::NonRelational),
-					Some(FieldKind::Related(..)) => {
+				let field_key = _G(lhs);
+				let field = field_key.and_then(|field| model_entry.fields.as_ref()?.get(&field));
+				match field.as_ref().map(|f| (&f.kind, f.type_)) {
+					Some((FieldKind::Relational(rel), _)) => resolved = Some(*rel),
+					Some((FieldKind::Value, type_)) => {
+						// Check if it's a Properties field - these support dynamic property access
+						if _R(type_) == "Properties" {
+							return Err(ResolveMappedError::Properties {
+								field_name: lhs.to_string(),
+								remaining: rhs.to_string(),
+							});
+						}
+						return Err(ResolveMappedError::NonRelational);
+					}
+					None => return Err(ResolveMappedError::NonRelational),
+					Some((FieldKind::Related(..), _)) => {
 						drop(model_entry);
 						resolved = self.resolve_related_field(_G(lhs).unwrap().into(), *model);
 					}
@@ -834,6 +1255,30 @@ impl ModelIndex {
 			FieldKind::Related(_) => None,
 		}
 	}
+
+	/// Get the comodel (related model) for a field on a given model.
+	///
+	/// This is a convenience method that takes string names and returns the comodel's Spur
+	/// if the field is relational (Many2one, One2many, Many2many) or a Related field
+	/// that resolves to a relational field.
+	///
+	/// Returns `None` if:
+	/// - The model doesn't exist
+	/// - The field doesn't exist on the model
+	/// - The field is not relational (e.g., Char, Integer, etc.)
+	///
+	/// # Example
+	///
+	/// ```ignore
+	/// // For a model with: partner_id = fields.Many2one("res.partner")
+	/// let comodel = index.models.get_field_comodel("sale.order", "partner_id");
+	/// assert_eq!(comodel, Some("res.partner"));
+	/// ```
+	pub fn get_field_comodel(&self, model_name: &str, field_name: &str) -> Option<Spur> {
+		let model_key = _G(model_name)?;
+		let field_key = _G(field_name)?;
+		self.resolve_related_field(field_key.into(), model_key)
+	}
 }
 
 #[rustfmt::skip]
@@ -853,8 +1298,7 @@ impl ModelEntry {
 		};
 		if self.docstring.is_none() {
 			let contents = std::fs::read(loc.path.to_path())?;
-			let mut parser = Parser::new();
-			parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
+			let mut parser = python_parser();
 			let ast = parser.parse(&contents, None).ok_or_else(|| errloc!("AST not parsed"))?;
 			let query = ModelHelp::query();
 			let mut cursor = QueryCursor::new();
@@ -919,12 +1363,12 @@ fn parse_help<'text>(node: &Node, contents: &'text str) -> Cow<'text, str> {
 mod tests {
 	use pretty_assertions::assert_eq;
 	use std::collections::HashSet;
-	use tree_sitter::{Parser, QueryCursor, StreamingIterator, StreamingIteratorMut};
+	use tree_sitter::{QueryCursor, StreamingIterator, StreamingIteratorMut};
 
 	use crate::{
 		index::{_I, _R, ModelQuery},
 		test_utils::cases::foo::{FOO_PY, prepare_foo_index},
-		utils::acc_vec,
+		utils::{acc_vec, python_parser},
 	};
 
 	fn clamp_str(str: &str) -> &str {
@@ -934,8 +1378,7 @@ mod tests {
 	#[test]
 	fn test_model_query() {
 		let query = ModelQuery::query();
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let ast = parser.parse(FOO_PY, None).unwrap();
 		let matches = QueryCursor::new()
 			.matches(query, ast.root_node(), FOO_PY)
@@ -957,27 +1400,27 @@ mod tests {
 			[
 				[
 					(Some(T::Model), "class Foo("),
-					(None, "Model"),
+					(Some(T::BaseClass), "Model"),
 					(Some(T::Name), "_name"),
 				],
 				[
 					(Some(T::Model), "class Bar("),
-					(None, "Model"),
+					(Some(T::BaseClass), "Model"),
 					(Some(T::Name), "_name"),
 				],
 				[
 					(Some(T::Model), "class Bar("),
-					(None, "Model"),
+					(Some(T::BaseClass), "Model"),
 					(Some(T::Name), "_inherit"),
 				],
 				[
 					(Some(T::Model), "class Quux"),
-					(None, "Model"),
+					(Some(T::BaseClass), "Model"),
 					(Some(T::Name), "_name"),
 				],
 				[
 					(Some(T::Model), "class Quux"),
-					(None, "Model"),
+					(Some(T::BaseClass), "Model"),
 					(Some(T::Name), "_inherit"),
 				]
 			]

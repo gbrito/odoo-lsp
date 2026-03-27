@@ -20,17 +20,24 @@ use xmlparser::{Token, Tokenizer};
 use crate::prelude::*;
 
 pub use crate::component::{Component, ComponentName};
-use crate::model::{Model, ModelIndex, ModelLocation, ModelType};
+use crate::model::{FunctionIndex, Model, ModelBaseType, ModelIndex, ModelLocation, ModelType};
 use crate::record::{Record, RecordMetadata};
 use crate::template::{NewTemplate, gather_templates};
 pub use crate::template::{Template, TemplateName};
 
+pub mod access;
+pub mod controller;
 mod js;
 mod module;
 mod record;
 pub(crate) mod symbol;
 mod template;
 
+pub use access::{AccessIndex, AccessRule, AccessRuleId};
+pub use controller::{
+    AuthType, ControllerClass, ControllerRoute, HttpMethod, ReadonlyValue, RouteConverter,
+    RouteIndex, RouteParam, RoutePath, RouteType,
+};
 pub use js::JsQuery;
 pub use module::ModuleEntry;
 pub use record::{RecordId, SymbolMap, SymbolSet};
@@ -66,11 +73,22 @@ pub struct Index {
 	pub records: record::RecordIndex,
 	pub templates: template::TemplateIndex,
 	pub models: ModelIndex,
+	pub functions: FunctionIndex,
 	pub components: js::ComponentIndex,
 	#[default(_code = "DashMap::with_shard_amount(4)")]
 	pub widgets: DashMap<ImStr, MinLoc>,
 	#[default(_code = "DashMap::with_shard_amount(4)")]
 	pub actions: DashMap<ImStr, MinLoc>,
+	/// Security access rules from ir.model.access.csv files
+	pub access_rules: access::AccessIndex,
+	/// Controller routes from @http.route() decorators
+	pub routes: controller::RouteIndex,
+	/// Discovered services from registry.category("services").add()
+	#[default(_code = "crate::hook::ServiceIndex::with_builtins()")]
+	pub services: crate::hook::ServiceIndex,
+	/// Known hook definitions (built-in + discovered)
+	#[default(_code = "crate::hook::HookIndex::with_builtins()")]
+	pub hooks: crate::hook::HookIndex,
 	/// Tracks auto_install modules that couldn't be loaded due to missing dependencies
 	/// Maps module_name -> list of missing dependencies with their dependency chains
 	#[default(_code = "DashMap::with_shard_amount(4)")]
@@ -80,6 +98,8 @@ pub struct Index {
 	pub(crate) transitive_deps_cache: DashMap<ModuleName, HashSet<ModuleName>>,
 	#[default(_code = "Cache::new(16)")]
 	pub(crate) ast_cache: Cache<PathBuf, Arc<AstCacheItem>>,
+	/// Call graph for call hierarchy support
+	pub call_graph: crate::call_graph::CallGraph,
 }
 
 pub struct AstCacheItem {
@@ -99,11 +119,17 @@ enum Output {
 	Models {
 		path: PathSymbol,
 		models: Vec<Model>,
+		functions: Vec<NewFunction>,
+		routes: Vec<controller::ControllerRoute>,
 	},
 	JsItems {
 		components: HashMap<ComponentName, Component>,
 		widgets: Vec<(ImStr, MinLoc)>,
 		actions: Vec<(ImStr, MinLoc)>,
+		services: Vec<crate::hook::ServiceDefinition>,
+	},
+	AccessRules {
+		rules: Vec<access::AccessRule>,
 	},
 }
 
@@ -187,7 +213,10 @@ impl Index {
 							auto_install: false,
 						});
 					let module = ModuleEntry {
-						path: module_path.to_str().expect("non-utf8 path").into(),
+						path: module_path
+							.to_str()
+							.unwrap_or_else(|| panic!("{}", format_loc!("non-utf8 path: {:?}", module_path)))
+							.into(),
 						dependencies: manifest_info.dependencies,
 						auto_install: manifest_info.auto_install,
 						loaded: Default::default(),
@@ -197,7 +226,9 @@ impl Index {
 				}
 				std::collections::hash_map::Entry::Occupied(preexisting) => {
 					if let (Some(client), "base") = (client.clone(), module_name.as_str()) {
-						let duplicate_path = module_path.to_str().expect("non-utf8 path");
+						let duplicate_path = module_path
+							.to_str()
+							.unwrap_or_else(|| panic!("{}", format_loc!("non-utf8 path: {:?}", module_path)));
 						tokio::spawn(Self::notify_duplicate_base(
 							client,
 							preexisting.get().path.clone(),
@@ -569,7 +600,7 @@ impl Index {
 
 		let mut outputs = tokio::task::JoinSet::new();
 		for (module_key, root) in modules.into_iter().zip(roots.into_iter()) {
-			trace!("{} depends on {}", _R(module_name), _R(module_key));
+
 			let root_display = root.key().to_string_lossy();
 			let root_key = _I(&root_display);
 			let module = root
@@ -605,7 +636,7 @@ impl Index {
 						}
 					};
 					let path = py.path().to_path_buf();
-					outputs.spawn(add_root_py(root_key, path));
+					outputs.spawn(add_root_py(root_key, path, module_key));
 				}
 			}
 			if let Ok(scripts) = globwalk::glob_builder(format!("{}/**/*.js", module_dir.display()))
@@ -617,6 +648,25 @@ impl Index {
 					let Ok(js) = js else { continue };
 					let path = js.path().to_path_buf();
 					outputs.spawn(js::add_root_js(root_key, path));
+				}
+			}
+			// Index security CSV files (ir.model.access.csv)
+			if let Ok(csvs) = globwalk::glob_builder(format!("{}/security/*.csv", module_dir.display()))
+				.file_type(FileType::FILE | FileType::SYMLINK)
+				.follow_links(true)
+				.build()
+			{
+				for csv in csvs {
+					let Ok(csv) = csv else { continue };
+					let path = csv.path().to_path_buf();
+					// Only process ir.model.access.csv files
+					if path
+						.file_name()
+						.map(|n| n.to_string_lossy().contains("ir.model.access"))
+						.unwrap_or(false)
+					{
+						outputs.spawn(add_root_csv(root_key, path, module_key));
+					}
 				}
 			}
 		}
@@ -642,25 +692,45 @@ impl Index {
 					self.records.append(records.into_iter().zip(metadata.into_iter()));
 					self.templates.append(templates);
 				}
-				Output::Models { path, models } => {
-					self.models.append(path, false, &models);
+			Output::Models { path, models, functions, routes } => {
+				self.models.append(path, false, &models);
+				// Index functions
+				use crate::model::Function;
+				self.functions.append(
+					path,
+					functions.into_iter().map(|f| {
+						let name_sym: Symbol<Function> = _I(&f.name).into();
+						(name_sym, f.location)
+					}),
+				);
+				// Index controller routes
+				for route in routes {
+					self.routes.insert(route);
 				}
-				Output::JsItems {
-					components,
-					widgets,
-					actions,
-				} => {
-					self.components.extend(components);
-					for (widget, loc) in widgets {
-						if !self.widgets.contains_key(&widget) {
-							self.widgets.insert(widget, loc);
-						}
+			}
+			Output::JsItems {
+				components,
+				widgets,
+				actions,
+				services,
+			} => {
+				self.components.extend(components);
+				for (widget, loc) in widgets {
+					if !self.widgets.contains_key(&widget) {
+						self.widgets.insert(widget, loc);
 					}
-					for (action, loc) in actions {
-						if !self.actions.contains_key(&action) {
-							self.actions.insert(action, loc);
-						}
+				}
+				for (action, loc) in actions {
+					if !self.actions.contains_key(&action) {
+						self.actions.insert(action, loc);
 					}
+				}
+				for service in services {
+					self.services.add_or_update(service);
+				}
+			}
+				Output::AccessRules { rules } => {
+					self.access_rules.append(rules);
 				}
 			}
 		}
@@ -978,8 +1048,7 @@ fn parse_manifest_info(manifest: &Path) -> anyhow::Result<ManifestInfo> {
 	}
 
 	let contents = test_utils::fs::read_to_string(manifest)?;
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
+	let mut parser = python_parser();
 	let ast = ok!(parser.parse(&contents, None));
 
 	let mut cursor = QueryCursor::new();
@@ -1079,35 +1148,235 @@ async fn add_root_xml(root: Spur, path: PathBuf, module_name: ModuleName) -> any
 	})
 }
 
+/// Parse an ir.model.access.csv file and extract access rules.
+///
+/// CSV format: id,name,model_id:id,group_id:id,perm_read,perm_write,perm_create,perm_unlink
+async fn add_root_csv(root: Spur, path: PathBuf, module_name: ModuleName) -> anyhow::Result<Output> {
+	use access::{parse_csv_bool, parse_group_ref, parse_model_ref, AccessRule};
+
+	let path_uri = PathSymbol::strip_root(root, &path);
+	let file = ok!(tokio::fs::read(&path).await, "Could not read {}", path.display());
+	let file = String::from_utf8_lossy(&file);
+	let rope = Rope::from_str(&file);
+
+	let mut rules = vec![];
+	let mut lines = file.lines().enumerate();
+
+	// Parse header to understand column positions
+	let Some((_, header)) = lines.next() else {
+		return Ok(Output::AccessRules { rules });
+	};
+
+	let headers: Vec<&str> = header.split(',').map(|s| s.trim()).collect();
+
+	// Find column indices (handle different column orders)
+	let id_idx = headers.iter().position(|&h| h == "id");
+	let name_idx = headers.iter().position(|&h| h == "name");
+	let model_idx = headers.iter().position(|&h| h == "model_id:id" || h == "model_id/id");
+	let group_idx = headers.iter().position(|&h| h == "group_id:id" || h == "group_id/id");
+	let read_idx = headers.iter().position(|&h| h == "perm_read");
+	let write_idx = headers.iter().position(|&h| h == "perm_write");
+	let create_idx = headers.iter().position(|&h| h == "perm_create");
+	let unlink_idx = headers.iter().position(|&h| h == "perm_unlink");
+
+	// Require at minimum id and model_id columns
+	let (Some(id_idx), Some(model_idx)) = (id_idx, model_idx) else {
+		debug!(
+			"CSV file {} missing required columns (id, model_id:id)",
+			path.display()
+		);
+		return Ok(Output::AccessRules { rules });
+	};
+
+	for (line_num, line) in lines {
+		let line = line.trim();
+		if line.is_empty() || line.starts_with('#') {
+			continue;
+		}
+
+		// Parse CSV fields (basic CSV parsing - handles quoted fields)
+		let fields = parse_csv_line(line);
+		if fields.len() <= id_idx.max(model_idx) {
+			continue;
+		}
+
+		let id = fields[id_idx].trim();
+		if id.is_empty() {
+			continue;
+		}
+
+		// Parse model reference (e.g., "model_sale_order" -> "sale.order")
+		let model_ref = fields.get(model_idx).map(|s| s.trim()).unwrap_or("");
+		let Some(model_name) = parse_model_ref(model_ref) else {
+			debug!("Could not parse model_id '{}' in {}", model_ref, path.display());
+			continue;
+		};
+
+		let name = name_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| s.trim())
+			.unwrap_or(id);
+
+		// Parse group reference
+		let group_id = group_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| s.trim())
+			.filter(|s| !s.is_empty())
+			.map(|g| {
+				let qualified = parse_group_ref(g, module_name);
+				_I(&qualified).into()
+			});
+
+		// Parse permissions
+		let perm_read = read_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| parse_csv_bool(s))
+			.unwrap_or(false);
+		let perm_write = write_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| parse_csv_bool(s))
+			.unwrap_or(false);
+		let perm_create = create_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| parse_csv_bool(s))
+			.unwrap_or(false);
+		let perm_unlink = unlink_idx
+			.and_then(|i| fields.get(i))
+			.map(|s| parse_csv_bool(s))
+			.unwrap_or(false);
+
+		// Calculate line range for location
+		let rope_slice = rope.slice(..);
+		let line_start = rope_slice.line_to_byte_idx(line_num, LINE_TYPE);
+		let num_lines = rope_slice.len_lines(LINE_TYPE);
+		let line_end = if line_num + 1 < num_lines {
+			rope_slice.line_to_byte_idx(line_num + 1, LINE_TYPE)
+		} else {
+			file.len()
+		};
+		let start = rope_conv(ByteOffset(line_start), rope_slice);
+		let end = rope_conv(ByteOffset(line_end.saturating_sub(1)), rope_slice);
+
+		rules.push(AccessRule {
+			id: id.into(),
+			module: module_name,
+			name: name.into(),
+			model_id: _I(&model_name).into(),
+			group_id,
+			perm_read,
+			perm_write,
+			perm_create,
+			perm_unlink,
+			location: MinLoc {
+				path: path_uri,
+				range: Range { start, end },
+			},
+			deleted: false,
+		});
+	}
+
+	Ok(Output::AccessRules { rules })
+}
+
+/// Parse a CSV line, handling quoted fields.
+fn parse_csv_line(line: &str) -> Vec<&str> {
+	let mut fields = vec![];
+	let mut start = 0;
+	let mut in_quotes = false;
+	let bytes = line.as_bytes();
+
+	for (i, &byte) in bytes.iter().enumerate() {
+		match byte {
+			b'"' => in_quotes = !in_quotes,
+			b',' if !in_quotes => {
+				fields.push(&line[start..i]);
+				start = i + 1;
+			}
+			_ => {}
+		}
+	}
+	// Don't forget the last field
+	if start <= line.len() {
+		fields.push(&line[start..]);
+	}
+	fields
+}
+
 #[rustfmt::skip]
 query! {
 	#[derive(Debug, PartialEq, Eq)]
-	ModelQuery(Model, Name);
+	ModelQuery(Model, Name, BaseClass);
 ((class_definition
   (argument_list [
-    (identifier) @_Model
+    (identifier) @BASE_CLASS
     (attribute
-      (identifier) @_models (identifier) @_Model) ])
+      (identifier) @_models (identifier) @BASE_CLASS) ])
   (block
     (expression_statement
       (assignment (identifier) @NAME)) )) @MODEL
   (#eq? @_models "models")
-  (#match? @_Model "^(Transient|Abstract)?Model$")
+  (#match? @BASE_CLASS "^(Transient|Abstract)?Model$")
   (#match? @NAME "^_(name|inherits?)$"))
 }
 
-async fn add_root_py(root: Spur, path: PathBuf) -> anyhow::Result<Output> {
+// Query for extracting controller routes from @http.route() and @route() decorators.
+//
+// This captures:
+// - Controller class name and parent class
+// - Route decorator with arguments
+// - Method definition with name and parameters
+//
+// IMPORTANT: Predicates MUST be inside the outer parentheses to be evaluated.
+#[rustfmt::skip]
+query! {
+	RouteQuery(ControllerClass, ParentClass, RouteDecorator, RouteArgs, MethodDef, MethodName, MethodParams);
+
+// Pattern 1: @http.route('/path', ...) decorator
+((class_definition
+  name: (identifier) @CONTROLLER_CLASS
+  superclasses: (argument_list (_) @PARENT_CLASS)?
+  body: (block
+    (decorated_definition
+      (decorator
+        (call
+          function: (attribute
+            object: (identifier) @_http
+            attribute: (identifier) @_route)
+          arguments: (argument_list) @ROUTE_ARGS) @ROUTE_DECORATOR)
+      (function_definition
+        name: (identifier) @METHOD_NAME
+        parameters: (parameters) @METHOD_PARAMS) @METHOD_DEF)))
+  (#eq? @_http "http")
+  (#eq? @_route "route"))
+
+// Pattern 2: @route('/path', ...) decorator (from odoo.http import route)
+((class_definition
+  name: (identifier) @CONTROLLER_CLASS
+  superclasses: (argument_list (_) @PARENT_CLASS)?
+  body: (block
+    (decorated_definition
+      (decorator
+        (call
+          function: (identifier) @_route
+          arguments: (argument_list) @ROUTE_ARGS) @ROUTE_DECORATOR)
+      (function_definition
+        name: (identifier) @METHOD_NAME
+        parameters: (parameters) @METHOD_PARAMS) @METHOD_DEF)))
+  (#eq? @_route "route"))
+}
+
+async fn add_root_py(root: Spur, path: PathBuf, module: ModuleName) -> anyhow::Result<Output> {
 	let contents = ok!(tokio::fs::read(&path).await, "Could not read {}", path.display());
 
 	let path = PathSymbol::strip_root(root, &path);
 	let models = index_models(&contents)?;
-	Ok(Output::Models { path, models })
+	let functions = index_functions(&contents, path).unwrap_or_default();
+	let routes = index_controllers(&contents, path, module).unwrap_or_default();
+	Ok(Output::Models { path, models, functions, routes })
 }
 
 pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
-	let mut parser = tree_sitter::Parser::new();
-	parser.set_language(&tree_sitter_python::LANGUAGE.into())?;
-
+	let mut parser = python_parser();
 	let ast = parser
 		.parse(contents, None)
 		.ok_or_else(|| anyhow!("{} AST not parsed", loc!()))?;
@@ -1120,6 +1389,7 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 		byte_range: ByteRange,
 		name: Option<&'a [u8]>,
 		inherits: Vec<&'a [u8]>,
+		base_type: ModelBaseType,
 	}
 	let mut matches = cursor.matches(query, ast.root_node(), contents);
 	while let Some(match_) = matches.next() {
@@ -1131,11 +1401,23 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 			.nodes_for_capture_index(ModelQuery::Name as _)
 			.next()
 			.ok_or_else(|| errloc!("capture"))?;
+		
+		// Get the base class type (Model, TransientModel, AbstractModel)
+		let base_type = match_
+			.nodes_for_capture_index(ModelQuery::BaseClass as _)
+			.next()
+			.map(|node| {
+				let class_name = std::str::from_utf8(&contents[node.byte_range()]).unwrap_or("Model");
+				ModelBaseType::from_class_name(class_name)
+			})
+			.unwrap_or_default();
+		
 		let model = models.entry(model_node.id()).or_insert_with(|| NewModel {
 			name: None,
 			range: model_node.range(),
 			byte_range: model_node.byte_range().map_unit(ByteOffset),
 			inherits: vec![],
+			base_type,
 		});
 		match &contents[capture.byte_range()] {
 			b"_name" => {
@@ -1187,7 +1469,7 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 					if pair.kind() != "pair" {
 						continue;
 					}
-					let key = pair.named_child(0).expect("key");
+					let key = pair.named_child(0).expect("pair node must have a key child");
 					if key.kind() == "string" {
 						model.inherits.push(&contents[key.byte_range().shrink(1)]);
 					}
@@ -1215,10 +1497,12 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 			.collect::<Vec<_>>();
 		let range = span_conv(model.range);
 		let byte_range = model.byte_range;
+		let base_type = model.base_type;
 		match (inherits.is_empty(), model.name) {
 			(false, None) => Some(Model {
 				range,
 				byte_range,
+				base_type,
 				// if _name is not defined and _inherit = [A, B, C], A is considered the inherit base by default
 				type_: ModelType::Inherit(inherits),
 			}),
@@ -1228,6 +1512,7 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 					Some(Model {
 						range,
 						byte_range,
+						base_type,
 						type_: ModelType::Inherit(inherits),
 					})
 				} else {
@@ -1238,6 +1523,7 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 						},
 						range,
 						byte_range,
+						base_type,
 					})
 				}
 			}
@@ -1246,15 +1532,396 @@ pub fn index_models(contents: &[u8]) -> anyhow::Result<Vec<Model>> {
 	Ok(models.collect())
 }
 
+/// Struct representing a newly discovered module-level function
+pub struct NewFunction {
+	pub name: ImStr,
+	pub location: MinLoc,
+}
+
+/// Index module-level functions from Python content
+pub fn index_functions(contents: &[u8], path: PathSymbol) -> anyhow::Result<Vec<NewFunction>> {
+	use crate::python::ModuleFunction;
+	use tracing::trace;
+
+	let mut parser = python_parser();
+	let ast = parser
+		.parse(contents, None)
+		.ok_or_else(|| anyhow!("{} AST not parsed", loc!()))?;
+	let query = ModuleFunction::query();
+	let mut cursor = QueryCursor::new();
+
+	let mut functions = Vec::new();
+	let mut matches = cursor.matches(query, ast.root_node(), contents);
+
+	trace!("index_functions: parsing {:?}", path);
+	let mut match_count = 0;
+
+	while let Some(match_) = matches.next() {
+		match_count += 1;
+		trace!("index_functions: found match {} with {} captures", match_count, match_.captures.len());
+		let Some(name_node) = match_
+			.nodes_for_capture_index(ModuleFunction::FuncName as _)
+			.next()
+		else {
+			continue;
+		};
+
+		let Some(body_node) = match_
+			.nodes_for_capture_index(ModuleFunction::FuncBody as _)
+			.next()
+		else {
+			continue;
+		};
+
+		let name = String::from_utf8_lossy(&contents[name_node.byte_range()]);
+		trace!("index_functions: found function '{}'", name);
+		functions.push(NewFunction {
+			name: ImStr::from(name.as_ref()),
+			location: MinLoc {
+				path,
+				range: span_conv(body_node.range()),
+			},
+		});
+	}
+
+	Ok(functions)
+}
+
+/// Index controller routes from Python content.
+///
+/// This function parses Python files looking for `@http.route()` and `@route()` decorators
+/// on methods within controller classes.
+pub fn index_controllers(
+	contents: &[u8],
+	path: PathSymbol,
+	module: ModuleName,
+) -> anyhow::Result<Vec<controller::ControllerRoute>> {
+	use controller::{parse_url_params, ControllerRoute};
+	use tracing::trace;
+
+	let mut parser = python_parser();
+	let ast = parser
+		.parse(contents, None)
+		.ok_or_else(|| anyhow!("{} AST not parsed", loc!()))?;
+	let query = RouteQuery::query();
+	let mut cursor = QueryCursor::new();
+
+	let mut routes = Vec::new();
+	let mut matches = cursor.matches(query, ast.root_node(), contents);
+
+	trace!("index_controllers: parsing {:?}", path);
+
+	while let Some(match_) = matches.next() {
+		// Extract controller class name
+		let Some(class_node) = match_
+			.nodes_for_capture_index(RouteQuery::ControllerClass as _)
+			.next()
+		else {
+			continue;
+		};
+		let controller_class =
+			ImStr::from(String::from_utf8_lossy(&contents[class_node.byte_range()]).as_ref());
+
+		// Extract parent class (if any)
+		let parent_class = match_
+			.nodes_for_capture_index(RouteQuery::ParentClass as _)
+			.next()
+			.map(|n| String::from_utf8_lossy(&contents[n.byte_range()]).to_string());
+
+		// Extract route decorator arguments
+		let Some(route_args_node) = match_
+			.nodes_for_capture_index(RouteQuery::RouteArgs as _)
+			.next()
+		else {
+			continue;
+		};
+
+		// Extract decorator node for location
+		let Some(decorator_node) = match_
+			.nodes_for_capture_index(RouteQuery::RouteDecorator as _)
+			.next()
+		else {
+			continue;
+		};
+
+		// Extract method name
+		let Some(method_name_node) = match_
+			.nodes_for_capture_index(RouteQuery::MethodName as _)
+			.next()
+		else {
+			continue;
+		};
+		let method_name =
+			ImStr::from(String::from_utf8_lossy(&contents[method_name_node.byte_range()]).as_ref());
+
+		// Extract method parameters
+		let method_params = match_
+			.nodes_for_capture_index(RouteQuery::MethodParams as _)
+			.next()
+			.map(|n| extract_method_params(n, contents))
+			.unwrap_or_default();
+
+		// Parse route decorator arguments
+		let route_info = parse_route_args(route_args_node, contents);
+
+		// Create routes for each path
+		for route_path in &route_info.paths {
+			let params = parse_url_params(route_path);
+
+			routes.push(ControllerRoute {
+				path: route_path.clone(),
+				paths: route_info.paths.clone(),
+				route_type: route_info.route_type,
+				auth: route_info.auth,
+				methods: route_info.methods.clone(),
+				csrf: route_info.csrf,
+				cors: route_info.cors.clone(),
+				website: route_info.website,
+				readonly: route_info.readonly.clone(),
+				method_name: method_name.clone(),
+				controller_class: controller_class.clone(),
+				params,
+				method_params: method_params.clone(),
+				location: crate::model::TrackedMinLoc::from(MinLoc {
+					path,
+					range: span_conv(decorator_node.range()),
+				}),
+				module,
+				overrides: parent_class.as_ref().map(|_| route_path.clone()),
+				deleted: false,
+			});
+		}
+	}
+
+	trace!(
+		"index_controllers: found {} routes in {:?}",
+		routes.len(),
+		path
+	);
+	Ok(routes)
+}
+
+/// Parsed route decorator arguments.
+struct ParsedRouteInfo {
+	paths: Vec<ImStr>,
+	route_type: controller::RouteType,
+	auth: controller::AuthType,
+	methods: Option<Vec<controller::HttpMethod>>,
+	csrf: Option<bool>,
+	cors: Option<ImStr>,
+	website: bool,
+	readonly: Option<controller::ReadonlyValue>,
+}
+
+impl Default for ParsedRouteInfo {
+	fn default() -> Self {
+		Self {
+			paths: Vec::new(),
+			route_type: controller::RouteType::Http,
+			auth: controller::AuthType::User,
+			methods: None,
+			csrf: None,
+			cors: None,
+			website: false,
+			readonly: None,
+		}
+	}
+}
+
+/// Parse route decorator arguments to extract path(s) and options.
+fn parse_route_args(args_node: Node, contents: &[u8]) -> ParsedRouteInfo {
+	use controller::{AuthType, HttpMethod, ReadonlyValue, RouteType};
+
+	let mut info = ParsedRouteInfo::default();
+	let mut cursor = args_node.walk();
+
+	// Iterate through children of argument_list
+	for child in args_node.named_children(&mut cursor) {
+		match child.kind() {
+			// First positional argument - route path(s)
+			"string" => {
+				// Single path
+				let path_str = extract_string_content(child, contents);
+				if !path_str.is_empty() && info.paths.is_empty() {
+					info.paths.push(path_str.into());
+				}
+			}
+			"list" => {
+				// Multiple paths: ['/path1', '/path2']
+				if info.paths.is_empty() {
+					let mut list_cursor = child.walk();
+					for item in child.named_children(&mut list_cursor) {
+						if item.kind() == "string" {
+							let path_str = extract_string_content(item, contents);
+							if !path_str.is_empty() {
+								info.paths.push(path_str.into());
+							}
+						}
+					}
+				}
+			}
+			"keyword_argument" => {
+				// Extract keyword name and value
+				if let Some(key_node) = child.child_by_field_name("name") {
+					let key = String::from_utf8_lossy(&contents[key_node.byte_range()]);
+					if let Some(value_node) = child.child_by_field_name("value") {
+						match key.as_ref() {
+							"type" => {
+								let value = extract_string_content(value_node, contents);
+								if let Ok(rt) = value.parse::<RouteType>() {
+									info.route_type = rt;
+								}
+							}
+							"auth" => {
+								let value = extract_string_content(value_node, contents);
+								if let Ok(at) = value.parse::<AuthType>() {
+									info.auth = at;
+								}
+							}
+							"methods" => {
+								// methods=['GET', 'POST']
+								if value_node.kind() == "list" {
+									let mut methods = Vec::new();
+									let mut list_cursor = value_node.walk();
+									for item in value_node.named_children(&mut list_cursor) {
+										if item.kind() == "string" {
+											let method_str = extract_string_content(item, contents);
+											if let Ok(method) = method_str.parse::<HttpMethod>() {
+												methods.push(method);
+											}
+										}
+									}
+									if !methods.is_empty() {
+										info.methods = Some(methods);
+									}
+								}
+							}
+							"csrf" => {
+								info.csrf = Some(extract_bool_value(value_node, contents));
+							}
+							"cors" => {
+								let value = extract_string_content(value_node, contents);
+								if !value.is_empty() {
+									info.cors = Some(value.into());
+								}
+							}
+							"website" => {
+								info.website = extract_bool_value(value_node, contents);
+							}
+							"readonly" => {
+								// Can be True, False, or a callable (mark as Dynamic)
+								match value_node.kind() {
+									"true" | "false" => {
+										info.readonly =
+											Some(ReadonlyValue::Static(extract_bool_value(value_node, contents)));
+									}
+									_ => {
+										// It's a callable or expression
+										info.readonly = Some(ReadonlyValue::Dynamic);
+									}
+								}
+							}
+							_ => {} // Ignore other kwargs
+						}
+					}
+				}
+			}
+			_ => {}
+		}
+	}
+
+	// Default path if none specified (for inheritance override scenarios)
+	if info.paths.is_empty() {
+		// Route decorator without path - this is an override
+		info.paths.push(ImStr::from(""));
+	}
+
+	info
+}
+
+/// Extract string content without quotes.
+fn extract_string_content(node: Node, contents: &[u8]) -> String {
+	if node.kind() != "string" {
+		return String::new();
+	}
+	let text = String::from_utf8_lossy(&contents[node.byte_range()]);
+	// Remove quotes (single, double, or triple)
+	let text = text.trim();
+	if text.starts_with("'''") || text.starts_with("\"\"\"") {
+		text.strip_prefix("'''")
+			.or_else(|| text.strip_prefix("\"\"\""))
+			.and_then(|s| s.strip_suffix("'''").or_else(|| s.strip_suffix("\"\"\"")))
+			.unwrap_or(text)
+			.to_string()
+	} else if text.starts_with('\'') || text.starts_with('"') {
+		text.strip_prefix('\'')
+			.or_else(|| text.strip_prefix('"'))
+			.and_then(|s| s.strip_suffix('\'').or_else(|| s.strip_suffix('"')))
+			.unwrap_or(text)
+			.to_string()
+	} else {
+		text.to_string()
+	}
+}
+
+/// Extract boolean value from a node.
+fn extract_bool_value(node: Node, contents: &[u8]) -> bool {
+	match node.kind() {
+		"true" => true,
+		"false" => false,
+		_ => {
+			// Check the text content
+			let text = String::from_utf8_lossy(&contents[node.byte_range()]);
+			text.trim() == "True"
+		}
+	}
+}
+
+/// Extract method parameters from a parameters node (excluding 'self').
+fn extract_method_params(node: Node, contents: &[u8]) -> Vec<ImStr> {
+	let mut params = Vec::new();
+	let mut cursor = node.walk();
+
+	for child in node.named_children(&mut cursor) {
+		match child.kind() {
+			"identifier" => {
+				let name = String::from_utf8_lossy(&contents[child.byte_range()]);
+				if name != "self" {
+					params.push(ImStr::from(name.as_ref()));
+				}
+			}
+			"default_parameter" | "typed_parameter" | "typed_default_parameter" => {
+				// Get the name from the first child
+				if let Some(name_node) = child.named_child(0) {
+					let name = String::from_utf8_lossy(&contents[name_node.byte_range()]);
+					if name != "self" {
+						params.push(ImStr::from(name.as_ref()));
+					}
+				}
+			}
+			"list_splat_pattern" | "dictionary_splat_pattern" => {
+				// *args or **kwargs - get name without prefix
+				if let Some(name_node) = child.named_child(0) {
+					let name = String::from_utf8_lossy(&contents[name_node.byte_range()]);
+					params.push(ImStr::from(name.as_ref()));
+				}
+			}
+			_ => {}
+		}
+	}
+
+	params
+}
+
 #[cfg(test)]
 mod tests {
 	use crate::index::{_I, Index, Interner, ModelQuery, ModuleEntry};
 	use crate::model::ModelType;
-	use crate::utils::acc_vec;
+	use crate::utils::{acc_vec, python_parser};
 	use pretty_assertions::assert_eq;
 	use std::collections::HashMap;
 	use std::path::{Path, PathBuf};
-	use tree_sitter::{Parser, QueryCursor, StreamingIterator, StreamingIteratorMut};
+	use tree_sitter::{QueryCursor, StreamingIterator, StreamingIteratorMut};
 
 	use super::{index_models, parse_manifest_info};
 
@@ -1827,6 +2494,7 @@ mod tests {
 			},
 			range: Default::default(),
 			byte_range: Default::default(),
+			base_type: Default::default(),
 		}];
 		index.models.append(path, false, &models);
 
@@ -1913,8 +2581,7 @@ mod tests {
 
 	#[test]
 	fn test_model_query() {
-		let mut parser = Parser::new();
-		parser.set_language(&tree_sitter_python::LANGUAGE.into()).unwrap();
+		let mut parser = python_parser();
 		let contents = br#"
 class Foo(models.AbstractModel):
 	_name = 'foo'
@@ -2032,5 +2699,145 @@ class TransifexCodeTranslation(models.Model):
 				panic!("Parsing should succeed but with incomplete results, got error: {e}");
 			}
 		}
+	}
+
+	#[test]
+	fn test_index_functions() {
+		use crate::python::ModuleFunction;
+		use tree_sitter::{QueryCursor, StreamingIterator};
+
+		let code = br#"
+def helper_returns_string():
+    return "hello"
+
+def helper_returns_int():
+    return 42
+
+class SomeModel:
+    def method_inside_class(self):
+        pass
+
+def helper_with_decorator():
+    pass
+"#;
+		
+		// Debug: check the query
+		let query = ModuleFunction::query();
+		println!("Query pattern count: {}", query.pattern_count());
+		println!("Query capture names: {:?}", query.capture_names());
+		
+		// Parse and print the tree
+		let mut parser = python_parser();
+		let ast = parser.parse(code, None).unwrap();
+		
+		println!("AST root: {:?}", ast.root_node());
+		println!("AST root kind: {}", ast.root_node().kind());
+		
+		// Manual query test
+		let mut cursor = QueryCursor::new();
+		let mut matches = cursor.matches(query, ast.root_node(), &code[..]);
+		let mut match_count = 0;
+		while let Some(m) = matches.next() {
+			match_count += 1;
+			println!("Match {} with {} captures", match_count, m.captures.len());
+			for cap in m.captures {
+				let text = String::from_utf8_lossy(&code[cap.node.byte_range()]);
+				println!("  Capture {}: {} -> '{}'", cap.index, cap.node.kind(), text);
+			}
+		}
+		println!("Total matches: {}", match_count);
+		
+		// Now test index_functions
+		use super::{index_functions, PathSymbol};
+		let path = PathSymbol::empty();
+		let functions = index_functions(code, path).unwrap();
+		
+		println!("Found {} functions", functions.len());
+		for f in &functions {
+			println!("  Function: '{}'", f.name);
+		}
+		
+		assert_eq!(functions.len(), 3, "Should find 3 module-level functions");
+		assert_eq!(<_ as AsRef<str>>::as_ref(&functions[0].name), "helper_returns_string");
+		assert_eq!(<_ as AsRef<str>>::as_ref(&functions[1].name), "helper_returns_int");
+		assert_eq!(<_ as AsRef<str>>::as_ref(&functions[2].name), "helper_with_decorator");
+	}
+
+	#[test]
+	fn test_route_query_no_false_positives() {
+		use tree_sitter::{QueryCursor, StreamingIterator};
+
+		// This code has decorators that are NOT @http.route or @route
+		// The RouteQuery should NOT match any of these
+		let code = br#"
+class Foo(Model):
+    _name = "foo"
+
+    bar = fields.Char()
+
+    @api.depends("foo_id")
+    def handler(self):
+        pass
+    
+    @api.onchange("bar")
+    def on_bar_change(self):
+        pass
+"#;
+
+		let query = super::RouteQuery::query();
+		println!("RouteQuery pattern count: {}", query.pattern_count());
+		println!("RouteQuery capture names: {:?}", query.capture_names());
+
+		let mut parser = python_parser();
+		let ast = parser.parse(code, None).unwrap();
+
+		let mut cursor = QueryCursor::new();
+		let mut matches = cursor.matches(query, ast.root_node(), &code[..]);
+		let mut match_count = 0;
+		while let Some(m) = matches.next() {
+			match_count += 1;
+			if m.captures.len() > 0 {
+				println!("Unexpected match {} with {} captures (pattern {}):", match_count, m.captures.len(), m.pattern_index);
+				for cap in m.captures {
+					let text = String::from_utf8_lossy(&code[cap.node.byte_range()]);
+					println!("  Capture {}: {} -> '{}'", cap.index, cap.node.kind(), text);
+				}
+			}
+		}
+		println!("RouteQuery found {} matches", match_count);
+		
+		// Should match 0 (no @http.route or @route in the code)
+		assert_eq!(match_count, 0, "RouteQuery should not match @api.depends or other non-route decorators");
+	}
+
+	#[test]
+	fn test_route_query_matches_http_route() {
+		use tree_sitter::QueryCursor;
+
+		// This code has @http.route decorators that SHOULD match
+		let code = br#"
+class MyController(http.Controller):
+    @http.route('/my/path', auth='public', type='http')
+    def my_handler(self, **kw):
+        pass
+"#;
+
+		let query = super::RouteQuery::query();
+		let mut parser = python_parser();
+		let ast = parser.parse(code, None).unwrap();
+
+		let mut cursor = QueryCursor::new();
+		let mut matches = cursor.matches(query, ast.root_node(), &code[..]);
+		let mut match_count = 0;
+		while let Some(m) = matches.next() {
+			match_count += 1;
+			println!("Match {} with {} captures:", match_count, m.captures.len());
+			for cap in m.captures {
+				let text = String::from_utf8_lossy(&code[cap.node.byte_range()]);
+				println!("  Capture {}: {} -> '{}'", cap.index, cap.node.kind(), text);
+			}
+		}
+
+		assert_eq!(match_count, 1, "RouteQuery should match @http.route decorator");
 	}
 }

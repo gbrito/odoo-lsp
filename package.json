@@ -25,7 +25,8 @@
 	"activationEvents": [
 		"onLanguage:xml",
 		"onLanguage:python",
-		"onLanguage:javascript"
+		"onLanguage:javascript",
+		"onLanguage:csv"
 	],
 	"publisher": "Desdaemon",
 	"main": "./dist/extension",

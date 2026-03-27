@@ -3,7 +3,8 @@ use core::ops::{Add, Sub};
 use std::borrow::Cow;
 use std::ffi::OsStr;
 use std::path::Path;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 
 use dashmap::try_result::TryResult;
 use ropey::RopeSlice;
@@ -142,8 +143,12 @@ impl Display for MinLoc {
 
 impl From<MinLoc> for Location {
 	fn from(value: MinLoc) -> Self {
+		// SAFETY: PathSymbol is always a valid path, so the URI will always parse.
+		// Using expect here instead of unwrap for better panic messages.
 		Location {
-			uri: format!("file://{}", value.path).parse().unwrap(),
+			uri: format!("file://{}", value.path)
+				.parse()
+				.expect("PathSymbol should always produce a valid file:// URI"),
 			range: value.range,
 		}
 	}
@@ -256,6 +261,27 @@ impl From<SpanAdapter<tree_sitter::Range>> for Range {
 			},
 		}
 	}
+}
+
+/// Converts a URI to a file path, returning an error with context if the URI is not a file:// URI.
+///
+/// # Errors
+/// Returns an error if the URI scheme is not `file://` or if the path cannot be converted.
+#[inline]
+pub fn uri_to_path(uri: &tower_lsp_server::ls_types::Uri) -> anyhow::Result<std::path::PathBuf> {
+	uri.to_file_path()
+		.map(|cow| cow.into_owned())
+		.ok_or_else(|| anyhow::anyhow!("URI '{}' is not a valid file:// path", uri.as_str()))
+}
+
+/// Converts a file path to a URI, returning an error with context if the path is not absolute.
+///
+/// # Errors
+/// Returns an error if the path is not absolute.
+#[inline]
+pub fn path_to_uri(path: impl AsRef<Path>) -> anyhow::Result<tower_lsp_server::ls_types::Uri> {
+	tower_lsp_server::ls_types::Uri::from_file_path(path.as_ref())
+		.ok_or_else(|| anyhow::anyhow!("Path '{}' is not an absolute path", path.as_ref().display()))
 }
 
 pub fn token_span<'r, 't>(token: &'r Token<'t>) -> &'r StrSpan<'t> {
@@ -764,6 +790,32 @@ where
 	acc
 }
 
+/// Creates a new Python parser with the language already configured.
+///
+/// # Panics
+/// Panics if the tree-sitter Python language fails to initialize (should never happen).
+#[inline]
+pub fn python_parser() -> tree_sitter::Parser {
+	let mut parser = tree_sitter::Parser::new();
+	parser
+		.set_language(&tree_sitter_python::LANGUAGE.into())
+		.expect("bug: failed to init python parser");
+	parser
+}
+
+/// Creates a new JavaScript parser with the language already configured.
+///
+/// # Panics
+/// Panics if the tree-sitter JavaScript language fails to initialize (should never happen).
+#[inline]
+pub fn js_parser() -> tree_sitter::Parser {
+	let mut parser = tree_sitter::Parser::new();
+	parser
+		.set_language(&tree_sitter_javascript::LANGUAGE.into())
+		.expect("bug: failed to init javascript parser");
+	parser
+}
+
 #[cfg(test)]
 mod tests {
 	use super::{WSL, to_display_path};
@@ -792,8 +844,6 @@ mod tests {
 
 	#[test]
 	fn test_python_first_nth_child_matching() {
-		use tree_sitter::Parser;
-		use tree_sitter_python::LANGUAGE;
 
 		let contents = r#"[
 			# A comment
@@ -804,8 +854,7 @@ mod tests {
 			}
 		}"#;
 
-		let mut parser = Parser::new();
-		parser.set_language(&LANGUAGE.into()).unwrap();
+		let mut parser = super::python_parser();
 		let tree = parser.parse(contents, None).unwrap();
 		let root = tree.root_node();
 		let list_node = root.named_child(0).unwrap();

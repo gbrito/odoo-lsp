@@ -5,9 +5,9 @@ use xmlparser::{ElementEnd, Token, Tokenizer};
 
 use crate::prelude::*;
 
-use crate::index::{_I, _R, ModuleName, PathSymbol, RecordId};
+use crate::index::{ModuleName, PathSymbol, RecordId, _I, _R};
 use crate::model::ModelName;
-use crate::{ImStr, errloc, some};
+use crate::{errloc, some, ImStr};
 
 #[derive(Debug)]
 pub struct Record {

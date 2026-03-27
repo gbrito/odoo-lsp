@@ -12,5 +12,8 @@
   },
   "completions": {
     "limit": 200
+  },
+  "diagnostics": {
+    "xml_validation": false
   }
 }

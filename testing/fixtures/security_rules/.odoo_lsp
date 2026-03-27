@@ -1,0 +1,8 @@
+{
+    "module": {
+        "roots": ["."]
+    },
+    "diagnostics": {
+        "xml_validation": false
+    }
+}

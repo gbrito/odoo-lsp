@@ -3,12 +3,12 @@ use std::{path::PathBuf, sync::Arc};
 use dashmap::DashMap;
 use lasso::Spur;
 use odoo_lsp::{
-	ImStr,
+	ImStr, format_loc,
 	index::{_I, _R},
-	utils::RangeExt,
+	utils::{RangeExt, js_parser},
 };
 use tracing::debug;
-use tree_sitter::{Parser, QueryCursor, StreamingIterator};
+use tree_sitter::{QueryCursor, StreamingIterator};
 use ts_macros::query;
 
 /// path -> \[defines]
@@ -36,9 +36,8 @@ pub(super) async fn gather_defines(file: PathBuf, index: Arc<DefineIndex>) -> an
 
 	let file = _I(file.to_string_lossy());
 
-	let mut parser = Parser::new();
-	parser.set_language(&tree_sitter_javascript::LANGUAGE.into())?;
-	let ast = parser.parse(&contents, None).expect("AST not parsed");
+	let mut parser = js_parser();
+	let ast = parser.parse(&contents, None).expect(&format_loc!("AST not parsed for {:?}", file));
 	let query = OdooDefines::query();
 	let mut cursor = QueryCursor::new();
 

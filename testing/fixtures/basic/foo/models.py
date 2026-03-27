@@ -10,7 +10,7 @@ class Foo(Model):
     #                           ^complete bar derived.bar foo foob
 
     def completions(self):
-        #^type Method(Symbol<ModelEntry>("foo"), "completions")
+        #^type Method[foo, completions]
         self.env["bar"]
         #         ^complete bar derived.bar foo foob
         self.env['bogus']
@@ -68,12 +68,50 @@ class Foob(Model):
             #^complete barb foo_id hoeh
         })
         self.
-        #   ^complete barb foo_id handler hoeh missing_depends
+        #   ^complete barb foo_id handler hoeh missing_depends test_constrains_invalid test_depends_dotted_invalid test_depends_dotted_valid test_depends_invalid test_depends_mixed test_onchange_invalid
 
     @api.depends("barb")
     def missing_depends(self):
         for record in self:
             record.barb = bool(record.foo_id)
+
+    # ============================================================
+    # Decorator Field Validation Tests
+    # Tests for invalid field names in @api.depends/constrains/onchange
+    # ============================================================
+
+    @api.depends("nonexistent_field")
+    #             ^diag Model `foob` has no field `nonexistent_field`
+    def test_depends_invalid(self):
+        pass
+
+    @api.constrains("bad_field")
+    #                ^diag Model `foob` has no field `bad_field`
+    def test_constrains_invalid(self):
+        pass
+
+    @api.onchange("missing_field")
+    #              ^diag Model `foob` has no field `missing_field`
+    def test_onchange_invalid(self):
+        pass
+
+    # Multiple fields in decorator - one valid, one invalid
+    @api.depends("foo_id", "also_nonexistent")
+    #                       ^diag Model `foob` has no field `also_nonexistent`
+    def test_depends_mixed(self):
+        pass
+
+    # Valid dotted path in @api.depends (should NOT produce diagnostic)
+    @api.depends("foo_id.bar")
+    def test_depends_dotted_valid(self):
+        pass
+
+    # Invalid dotted path in @api.depends
+    @api.depends("foo_id.nonexistent")
+    #                    ^diag Model `foo` has no field `nonexistent`
+    def test_depends_dotted_invalid(self):
+        pass
+
 
 class NonModel:
     __slots__ = ("foo", "bar")

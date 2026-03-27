@@ -14,7 +14,8 @@ class CheeseBox(models.Model):
     child_ids = fields.One2many('cheese.box')
     parent_id = fields.Many2one('cheese.box')
 
-    def cheesey(self):
+    def test_tuple_create(self):
+        # Tuple CREATE: (0, 0, {values})
         self.create([{
             'cheese_ids': [(0, 0, {
                 'name': ...
@@ -26,5 +27,23 @@ class CheeseBox(models.Model):
                     ''
                     #^complete name
                 })]
+            })]
+        }])
+
+    def test_tuple_update(self):
+        # Tuple UPDATE: (1, id, {values})
+        self.create([{
+            'cheese_ids': [(1, 42, {
+                'name': 'Updated'
+                #^complete name
+            })]
+        }])
+
+    def test_command_update(self):
+        # Command.update() object form
+        self.create([{
+            'cheese_ids': [Command.update(42, {
+                'name': 'Updated via Command'
+                #^complete name
             })]
         }])

@@ -1,9 +1,22 @@
-use std::{borrow::Borrow, collections::HashMap, fmt::Debug, iter::FusedIterator};
+use std::{borrow::Borrow, collections::HashMap, fmt::Debug, iter::FusedIterator, sync::Arc};
 
 use tracing::instrument;
 
 use super::Type;
 use crate::ImStr;
+use crate::prelude::PathSymbol;
+
+/// Information about an imported symbol.
+#[derive(Debug, Clone)]
+pub struct ImportInfo {
+	/// The module path (e.g., "odoo.addons.sale.models.order")
+	pub module_path: String,
+	/// The original name of the imported symbol
+	pub imported_name: String,
+}
+
+/// Map of local import names to their import info.
+pub type ImportMap = HashMap<String, ImportInfo>;
 
 /// The current environment, populated from the AST statement by statement.
 #[derive(Default, Clone)]
@@ -12,6 +25,10 @@ pub struct Scope {
 	pub parent: Option<Box<Scope>>,
 	/// TODO: Allow super(_, \<self>)
 	pub super_: Option<ImStr>,
+	/// The current file path, used for resolving module-level functions.
+	pub current_path: Option<PathSymbol>,
+	/// Import map for the current file, shared across all scopes.
+	pub imports: Option<Arc<ImportMap>>,
 }
 
 impl Debug for Scope {
@@ -50,9 +67,13 @@ impl Scope {
 	}
 	pub fn enter(&mut self, inherit_super: bool) {
 		*self = Scope::new(Some(core::mem::take(self)));
+		let parent = self.parent.as_ref().unwrap();
 		if inherit_super {
-			self.super_ = self.parent.as_ref().unwrap().super_.clone();
+			self.super_ = parent.super_.clone();
 		}
+		// Always inherit the current path and imports
+		self.current_path = parent.current_path;
+		self.imports = parent.imports.clone();
 	}
 	pub fn exit(&mut self) {
 		if let Some(parent) = self.parent.take() {
@@ -67,6 +88,10 @@ impl Scope {
 			variables: self.variables.iter(),
 			parent: self.parent.as_deref(),
 		}
+	}
+	/// Look up an import by its local name.
+	pub fn get_import(&self, name: &str) -> Option<&ImportInfo> {
+		self.imports.as_ref()?.get(name)
 	}
 }
 

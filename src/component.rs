@@ -4,6 +4,8 @@
 
 use tower_lsp_server::ls_types::Range;
 
+use crate::ImStr;
+use crate::hook::HookUsage;
 use crate::index::{Symbol, SymbolMap, TemplateIndex};
 use crate::template::TemplateName;
 use crate::utils::MinLoc;
@@ -20,6 +22,12 @@ pub struct Component {
 	/// Extended as part of normal inheritance.
 	pub extends: Option<ComponentName>,
 	pub template: Option<ComponentTemplate>,
+	/// Hooks used in this component's setup() method
+	pub hooks: Vec<HookUsage>,
+	/// Service names used via useService()
+	pub services: Vec<ImStr>,
+	/// Ref names defined via useRef()
+	pub refs: Vec<ImStr>,
 }
 
 #[derive(Debug)]
