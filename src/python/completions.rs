@@ -338,6 +338,7 @@ impl Backend {
 									&contents,
 									completions_limit,
 									Some(PropertyKind::Field),
+									None,
 									rope,
 								);
 							} else if let Some(cmdlist) = python_next_named_sibling(capture.node)
@@ -385,11 +386,14 @@ impl Backend {
 									} else {
 										PropertyKind::Method
 									};
-									let mapped_model = if descriptor == "inverse_name" {
-										super::extract_comodel_name(match_.captures, &contents)
-											.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
+									let (mapped_model, field_model_filter) = if descriptor == "inverse_name" {
+										(
+											super::extract_comodel_name(match_.captures, &contents)
+												.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)]),
+											this_model.inner,
+										)
 									} else {
-										this_model.inner
+										(this_model.inner, None)
 									};
 									return self.python_completions_for_prop(
 										root,
@@ -400,6 +404,7 @@ impl Backend {
 										&contents,
 										completions_limit,
 										Some(prop_kind),
+										field_model_filter,
 										rope,
 										);
 									}
@@ -586,6 +591,7 @@ impl Backend {
 								&contents,
 								completions_limit,
 								Some(PropertyKind::Field),
+								None,
 								rope,
 							);
 						}
@@ -925,6 +931,7 @@ impl Backend {
 		contents: &str,
 		completions_limit: usize,
 		prop_type: Option<PropertyKind>,
+		field_model_filter: Option<&str>,
 		rope: RopeSlice<'_>,
 	) -> anyhow::Result<Option<CompletionResponse>> {
 		let Mapped {
@@ -963,7 +970,7 @@ impl Backend {
 			ImStr::from(model_name),
 			rope,
 			prop_type,
-			None,
+			field_model_filter,
 			node.kind() == "string",
 			false,
 			&mut items,
