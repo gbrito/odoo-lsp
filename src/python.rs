@@ -741,7 +741,7 @@ impl Backend {
 							let slice = Cow::from(slice);
 							return self.index.jump_def_model(&slice);
 						} else if matches!(descriptor, "compute" | "search" | "inverse" | "related" | "inverse_name") {
-							let single_field = matches!(descriptor, "related" | "inverse_name");
+							let single_field = !matches!(descriptor, "related");
 							let mapped_model = if descriptor == "inverse_name" {
 								extract_comodel_name(match_.captures, &contents)
 									.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
@@ -1550,7 +1550,7 @@ impl Backend {
 							let slice = Cow::from(slice);
 							return self.index.hover_model(&slice, Some(lsp_range), false, None);
 						} else if matches!(descriptor, "compute" | "search" | "inverse" | "related" | "inverse_name") {
-							let single_field = matches!(descriptor, "related" | "inverse_name");
+							let single_field = !matches!(descriptor, "related");
 							let mapped_model = if descriptor == "inverse_name" {
 								extract_comodel_name(match_.captures, &contents)
 									.map(|comodel_name| &contents[comodel_name.byte_range().shrink(1)])
@@ -2277,10 +2277,20 @@ fn extract_string_needle_at_offset<'a>(
 
 fn extract_comodel_name<'tree>(captures: &[QueryCapture<'tree>], contents: &str) -> Option<Node<'tree>> {
 	for cap in captures {
-		if matches!(PyCompletions::from(cap.index), Some(PyCompletions::FieldDescriptor))
-			&& &contents[cap.node.byte_range()] == "comodel_name"
-		{
-			return python_next_named_sibling(cap.node);
+		match PyCompletions::from(cap.index) {
+			Some(PyCompletions::Model) => {
+				if let Some(parent) = cap.node.parent()
+					&& parent.kind() == "argument_list"
+				{
+					return Some(cap.node);
+				}
+			}
+			Some(PyCompletions::FieldDescriptor) => {
+				if &contents[cap.node.byte_range()] == "comodel_name" {
+					return python_next_named_sibling(cap.node);
+				}
+			}
+			_ => {}
 		}
 	}
 	None
